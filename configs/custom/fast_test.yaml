@@ -1,0 +1,11 @@
+# Configuration for quick testing
+defaults:
+  - ../experiment
+  - _self_
+
+evaluation:
+  num_samples: 10
+  save_attention_patterns: false
+
+model:
+  max_length: 256
