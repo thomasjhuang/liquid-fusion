@@ -3,6 +3,10 @@
 LiquidFusion is an attention mechanism that blends the ideas of H2O (Heavy Hitter Oracle for Efficient Generative Inference of Large Language Models) and 
 StreamingLLM. 
 
+# Notice
+The current state of this repo is in progress, therefore some of the evaluation and utility code is partially complete or not correctly referenced. 
+Base model code is mostly correct but also still in progress.
+
 ## Installation
 
 ```bash
@@ -32,7 +36,6 @@ liquid-fusion/
 │   │   └── streaming.py
 │   └── base_models.py
 ├── notebooks/
-│   └── results_analysis.ipynb
 ├── scripts/
 │   └── run_experiment.py
 └── utils/
