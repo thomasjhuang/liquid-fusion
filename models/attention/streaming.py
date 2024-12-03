@@ -4,23 +4,29 @@ import torch.nn.functional as F
 from ..base_models import AttentionWithMetrics
 import math
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from ..base_models import AttentionWithMetrics
-import math
-
-class StreamingAttention(BaseAttention):
+class StreamingAttention(BaseLlamaAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        use_cache: bool = False,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
+        use_cache: bool = False,
         **kwargs
     ):
+        # Use Flash Attention when available
+        if self.config._attn_implementation == "flash_attention_2":
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                sliding_window=self.window_size,  # Enable sliding window in Flash Attention
+                **kwargs
+            )
         if self.sink_cache['k'] is None:
             self.reset_cache()
             

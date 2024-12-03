@@ -11,3 +11,10 @@ wandb/
 .DS_Store
 .idea/
 .vscode/
+.ipynb_checkpoints/
+benchmark*results*.json
+benchmarking*results*.json
+*_results.json
+*_results.jsonl
+cache/
+.cache/
