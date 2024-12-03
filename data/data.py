@@ -6,6 +6,7 @@ import torch
 from datasets.utils.logging import set_verbosity_error
 import datasets
 import torch.multiprocessing as mp
+
 # Set start method to spawn
 if mp.get_start_method(allow_none=True) != 'spawn':
     mp.set_start_method('spawn', force=True)
@@ -24,25 +25,29 @@ class ModelDataset(Dataset):
         
         # Handle different dataset formats
         if isinstance(item, dict):
-            if 'text' in item:
-                text = item['text']
+            if 'goal' in item:  # PIQA format
+                choices = f"1. {item['sol1']}\n2. {item['sol2']}"
+                text = f"Goal: {item['goal']}\nChoices:\n{choices}"
+            elif 'ctx' in item:  # Hellaswag format
+                choices = "\n".join([f"{i+1}. {ending}" for i, ending in enumerate(item['endings'])])
+                text = f"Context: {item['ctx']}\nChoices:\n{choices}"
+            elif 'question' in item and 'choices' in item:  # MMLU format
+                choices = "\n".join([f"{i+1}. {choice}" for i, choice in enumerate(item['choices'])])
+                text = f"Question: {item['question']}\nChoices:\n{choices}"
             elif 'question' in item and 'passage' in item:  # BoolQ format
                 text = f"Question: {item['question']}\nPassage: {item['passage']}"
             elif 'premise' in item and 'hypothesis' in item:  # CB format
                 text = f"Premise: {item['premise']}\nHypothesis: {item['hypothesis']}"
             elif 'sentence1' in item and 'sentence2' in item:  # WiC/WSC format
                 text = f"{item['sentence1']} {item['sentence2']}"
-            elif 'goal' in item:  # PIQA format
-                text = f"{item['goal']}"
-            elif 'ctx' in item:  # Hellaswag format
-                text = item['ctx']
-            # New format handlers
             elif 'sentence' in item:  # Winogrande format
                 text = f"{item['sentence']} Option 1: {item['option1']} Option 2: {item['option2']}"
             elif 'context' in item and 'question' in item:  # PubMedQA format
                 text = f"Question: {item['question']}\nContext: {item['context']}"
             elif 'Problem' in item:  # MathQA format
                 text = f"Problem: {item['Problem']}\nRationale: {item['Rationale']}"
+            elif 'text' in item:
+                text = item['text']
             else:
                 raise ValueError(f"Unknown dataset format with keys: {item.keys()}")
         else:
@@ -62,14 +67,16 @@ class ModelDataset(Dataset):
         labels = input_ids.clone()
         
         return {
+            'text': text,  # Add the formatted text
             'input_ids': input_ids,
             'attention_mask': encodings['attention_mask'].squeeze(),
-            'labels': labels  # Add labels for perplexity calculation
+            'labels': labels
         }
 
 def collate_fn(batch):
     # Combine all items in the batch
     batch_dict = {
+        'text': [item['text'] for item in batch],  # Include text in batch
         'input_ids': torch.stack([item['input_ids'] for item in batch]),
         'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
         'labels': torch.stack([item['labels'] for item in batch])
@@ -94,19 +101,12 @@ class DatasetManager:
         if cache_key not in self.cached_datasets:
             print(f"Loading {dataset_name} dataset{f' ({dataset_config.config})' if dataset_config.config else ''} ({split} split) with batch_size={batch_size}...")
             try:
-                # Handle SuperGLUE datasets differently
-                if dataset_name == "super_glue":
-                    raw_dataset = load_dataset(
-                        dataset_name,
-                        dataset_config.config,
-                        split=split,
-                    )
-                else:
-                    raw_dataset = load_dataset(
-                        dataset_name,
-                        dataset_config.config,
-                        split=split,
-                    )
+                raw_dataset = load_dataset(
+                    dataset_name,
+                    dataset_config.config,
+                    split=split,
+                    trust_remote_code=True  # Add trust_remote_code
+                )
                 
                 processed_dataset = ModelDataset(raw_dataset, self.tokenizer, max_length=self.config.sequence_length)
                 

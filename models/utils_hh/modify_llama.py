@@ -15,13 +15,16 @@ from transformers.cache_utils import Cache, DynamicCache, StaticCache
 __all__ = ['convert_kvcache_llama_heavy_recent', 'LlamaAttention_heavy_hitter']
 
 class LlamaAttention_heavy_hitter(LlamaAttention):
-    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: LlamaConfig, layer_idx: int):
+        if layer_idx is None:
+            raise ValueError("layer_idx must be provided for LlamaAttention_heavy_hitter")
+            
         super().__init__(config)
         self.layer_idx = layer_idx
         
         # Heavy hitter specific attributes
-        self.heavy_budget_ratio = config.heavy_ratio
-        self.recent_budget_ratio = config.recent_ratio
+        self.heavy_budget_ratio = getattr(config, 'heavy_ratio', 0.5)  # Default to 0.5 if not specified
+        self.recent_budget_ratio = getattr(config, 'recent_ratio', 0.5)  # Default to 0.5 if not specified
         self.attention_masks_next = None 
         self.heavy_budget = None
         self.recent_budget = None
@@ -52,17 +55,22 @@ class LlamaAttention_heavy_hitter(LlamaAttention):
         
         # Handle DynamicCache
         if past_key_value is not None:
-            past_length = 0
-            if hasattr(past_key_value, 'get_seq_length'):  # DynamicCache case
-                past_length = past_key_value.get_seq_length()
-                if past_length > 0:
-                    key_states = torch.cat([past_key_value.key_cache, key_states], dim=2)
-                    value_states = torch.cat([past_key_value.value_cache, value_states], dim=2)
+            if isinstance(past_key_value, DynamicCache):
+                # Ensure the layer index exists in the cache
+                while len(past_key_value.key_cache) <= self.layer_idx:
+                    past_key_value.key_cache.append([])
+                    past_key_value.value_cache.append([])
+                
+                # Only concatenate if there's cached data for this layer
+                if past_key_value.key_cache[self.layer_idx] != []:
+                    key_states = torch.cat([past_key_value.key_cache[self.layer_idx], key_states], dim=2)
+                    value_states = torch.cat([past_key_value.value_cache[self.layer_idx], value_states], dim=2)
+                    kv_seq_len = key_states.shape[-2]
             else:  # Regular tuple case
                 past_length = past_key_value[0].shape[-2]
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
                 value_states = torch.cat([past_key_value[1], value_states], dim=2)
-            kv_seq_len += past_length
+                kv_seq_len += past_length
 
         # Get rotary embeddings
         if position_embeddings is None:
@@ -96,10 +104,6 @@ class LlamaAttention_heavy_hitter(LlamaAttention):
             attn_weights = attn_weights + attention_mask
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
-        # Apply heavy hitter attention mask
-        if self.attention_masks_next is not None:
-            attn_weights = attn_weights * self.attention_masks_next + (1 - self.attention_masks_next) * torch.finfo(attn_weights.dtype).min
-
         # Upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         
@@ -114,35 +118,68 @@ class LlamaAttention_heavy_hitter(LlamaAttention):
             self.cache_budget_records.append(self.cache_budget)
             self.input_length.append(attn_weights.shape[-1])
 
+        # Handle score accumulation with different sizes
         if self.previous_scores is not None:
+            # Resize previous scores if needed
+            if self.previous_scores.size(-1) != current_scores_sum.size(-1) - 1:
+                # Create new tensor of correct size
+                new_scores = torch.zeros_like(current_scores_sum[:, :-1])
+                # Copy as much of the old scores as possible
+                min_size = min(new_scores.size(-1), self.previous_scores.size(-1))
+                new_scores[:, -min_size:] = self.previous_scores[:, -min_size:]
+                self.previous_scores = new_scores
+            
             current_scores_sum[:, :-1] += self.previous_scores
         
         dtype_attn_weights = attn_weights.dtype
         attn_weights_devices = attn_weights.device
         assert attn_weights.shape[0] == 1
-        self.previous_scores = current_scores_sum
-        attn_mask = torch.ones(current_scores_sum.shape[0], current_scores_sum.shape[1]+1).to(dtype_attn_weights).to(attn_weights_devices)
+        self.previous_scores = current_scores_sum[:, :-1].clone()  # Store all but the last token
 
-        attn_tokens_all = self.previous_scores.shape[-1]
-    
-        # Ensure cache_budget is initialized before comparison
+        # Apply heavy hitter attention mask
+        if self.attention_masks_next is not None:
+            # Ensure mask matches the attention weights size
+            if self.attention_masks_next.size(-1) != attn_weights.size(-1):
+                # Create new mask of correct size
+                attn_mask = torch.ones(current_scores_sum.shape[0], attn_weights.size(-1)).to(dtype_attn_weights).to(attn_weights_devices)
+                if attn_weights.size(-1) > self.cache_budget:
+                    if self.recent_budget > 0:
+                        attn_mask[:, :-self.recent_budget] = 0
+                        if self.heavy_budget > 0:
+                            selected_set = current_scores_sum[:, :-self.recent_budget]
+                            _, keep_topk = selected_set.topk(k=min(self.heavy_budget, selected_set.size(-1)), dim=-1, largest=True)
+                            attn_mask = attn_mask.scatter(-1, keep_topk, 1)
+                self.attention_masks_next = attn_mask.clone().unsqueeze(0).unsqueeze(2)
+            
+            attn_weights = attn_weights * self.attention_masks_next + (1 - self.attention_masks_next) * torch.finfo(attn_weights.dtype).min
+
+        attn_mask = torch.ones(
+            current_scores_sum.shape[0], 
+            current_scores_sum.shape[1]
+        ).to(dtype_attn_weights).to(attn_weights_devices)
+        
+        attn_tokens_all = current_scores_sum.shape[-1]
+
+        # Apply heavy hitter and recent token masking
         if self.cache_budget is not None and attn_tokens_all > self.cache_budget:
             if self.recent_budget > 0:
                 attn_mask[:, :-self.recent_budget] = 0
-                selected_set = self.previous_scores[:, :-self.recent_budget]
+                selected_set = current_scores_sum[:, :-self.recent_budget]
             else:
                 attn_mask[:, :] = 0
-                selected_set = self.previous_scores
+                selected_set = current_scores_sum
 
             if self.heavy_budget > 0:
-                _, keep_topk = selected_set.topk(k=self.heavy_budget, dim=-1, largest=True)
+                _, keep_topk = selected_set.topk(k=min(self.heavy_budget, selected_set.size(-1)), dim=-1, largest=True)
                 attn_mask = attn_mask.scatter(-1, keep_topk, 1)
 
         self.attention_masks_next = attn_mask.clone().unsqueeze(0).unsqueeze(2)
 
-        score_mask = attn_mask[:,:-1]
-        score_mask[:, -self.recent_budget:] = 1
-        self.previous_scores = self.previous_scores * score_mask
+        # Update previous scores with mask
+        score_mask = attn_mask.clone()  # Use same size as current scores
+        if self.recent_budget > 0:
+            score_mask[:, -self.recent_budget:] = 1
+        self.previous_scores = current_scores_sum * score_mask
 
         # Calculate output
         attn_output = torch.matmul(attn_weights, value_states)
@@ -162,16 +199,32 @@ class LlamaAttention_heavy_hitter(LlamaAttention):
         return attn_output, attn_weights, past_key_value
 
 def convert_kvcache_llama_heavy_recent(model, config):
-    for name, module in reversed(model._modules.items()):
-        if len(list(module.children())) > 0:
-            # Get layer index from name if it exists
-            layer_idx = None
-            if 'layers.' in name:
+    """Convert model to use heavy hitter attention with proper layer indices."""
+    def _convert_module(module, prefix=""):
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+            
+            if isinstance(child, LlamaAttention):
+                # Extract layer index from the full name
+                layer_idx = None
                 try:
-                    layer_idx = int(name.split('layers.')[-1].split('.')[0])
-                except:
-                    pass
-            model._modules[name] = convert_kvcache_llama_heavy_recent(module, config)
-        if isinstance(module, LlamaAttention):
-            model._modules[name] = LlamaAttention_heavy_hitter(config, layer_idx)
-    return model
+                    if 'layers.' in full_name:
+                        layer_idx = int(full_name.split('layers.')[-1].split('.')[0])
+                except ValueError as e:
+                    print(f"Warning: Could not extract layer_idx from {full_name}")
+                    continue  # Skip conversion if we can't determine layer index
+                
+                if layer_idx is not None:
+                    # Create new attention layer with explicit layer_idx
+                    new_attention = LlamaAttention_heavy_hitter(config, layer_idx=layer_idx)
+                    # Copy existing weights
+                    new_attention.load_state_dict(child.state_dict())
+                    # Update module
+                    setattr(module, name, new_attention)
+            
+            elif len(list(child.children())) > 0:
+                _convert_module(child, full_name)
+                
+        return module
+
+    return _convert_module(model)
