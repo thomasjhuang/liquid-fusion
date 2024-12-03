@@ -1,14 +1,22 @@
 import argparse
 import logging
+import numpy as np
 import torch
 import json
 import os
 import time
 import signal
 import tqdm
+import copy
+import traceback
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from models.utils_hh.modify_llama import convert_kvcache_llama_heavy_recent, LlamaAttention_heavy_hitter
 
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%m/%d/%Y %H:%M:%S",
+    level=logging.DEBUG,  # Changed to DEBUG for more detailed logging
+)
 logger = logging.getLogger(__name__)
 
 class timeout:
@@ -26,6 +34,20 @@ class timeout:
     def __exit__(self, type, value, traceback):
         signal.alarm(0)
 
+ENABLE_Heavy_Hitter_FUNCTIONS = {
+    "llama": convert_kvcache_llama_heavy_recent,
+}
+
+TAGET_MODULE = {
+    "llama": LlamaAttention_heavy_hitter,
+}
+
+def set_seed(args):
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.n_gpu > 0:
+        torch.cuda.manual_seed_all(args.seed)
+
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -33,202 +55,161 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
-def get_repo_root():
-    """Get the absolute path to the repository root."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_path", type=str, default="")
+    parser.add_argument("--output_path", type=str, default="")
+    parser.add_argument("--model_name", type=str, default="")
+    parser.add_argument("--model_arch", type=str, default="llama")
+    parser.add_argument("--cache_dir", type=str, default="../../checkpoint/")
+    parser.add_argument("--heavy_ratio", type=float, default=0.1)
+    parser.add_argument("--recent_ratio", type=float, default=0.1)
+    parser.add_argument("--enable_small_cache", action="store_true")
+    parser.add_argument("--sample_num", type=int, default=1000)
+    parser.add_argument("--k", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_cuda", action="store_true")
+    parser.add_argument("--fp16", action="store_true")
+    args = parser.parse_args()
 
-def run_experiment(args):
-    # Constants for fail-fast behavior
+    # Constants
     MAX_GENERATION_TIME = 30  # seconds per sample
-    FAIL_FAST_THRESHOLD = 2048  # Maximum input tokens
-    MAX_TOTAL_TOKENS = 2048  # Maximum total tokens (input + output)
     SAVE_INTERVAL = 5  # Save every N samples
 
-    repo_root = get_repo_root()
-    input_path = os.path.join(repo_root, args.input_path)
-    output_path = os.path.join(repo_root, args.output_path)
+    args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
 
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    device = get_device()
-    logger.info(f"Using device: {device}")
+    logger.warning(f"device: {args.device}, n_gpu: {args.n_gpu}, 16-bits training: {args.fp16}")
+    set_seed(args)
 
     try:
-        # Load model and tokenizer
-        logger.info("Loading model and tokenizer...")
-        config = AutoConfig.from_pretrained(
-            args.model_name, 
-            cache_dir=args.cache_dir,
-            trust_remote_code=True
-        )
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_name, 
-            use_fast=True,
-            trust_remote_code=True
-        )
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            config=config,
-            torch_dtype=torch.float16,
-            trust_remote_code=True
-        )
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
 
-        # Apply H2O modifications if enabled
+        config = AutoConfig.from_pretrained(args.model_name, cache_dir=args.cache_dir)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True, cache_dir=args.cache_dir)
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, cache_dir=args.cache_dir)
+
         if args.enable_small_cache:
-            logger.info('Enabling H2O Cache')
+            print('Enable Small Cache Size')
             config.heavy_ratio = args.heavy_ratio
             config.recent_ratio = args.recent_ratio
-            checkpoint = model.state_dict()
-            model = convert_kvcache_llama_heavy_recent(model, config)
+            checkpoint = copy.deepcopy(model.state_dict())
+            model = ENABLE_Heavy_Hitter_FUNCTIONS[args.model_arch](model, config)
             model.load_state_dict(checkpoint)
 
-        model.half().eval().to(device)
+        model.half().eval().cuda()
+        logger.info(args)
 
-        # Load requests
-        logger.info("Loading requests...")
         requests = []
-        with open(input_path, 'r') as f:
+        with open(args.input_path, 'r') as f:
             for line in f:
-                if line.strip():
+                if line.strip() != '':
                     requests.append(json.loads(line))
 
-        total_requests = len(requests)
-        logger.info(f"Loaded {total_requests} requests")
-        
-        if args.sample_num < total_requests:
-            logger.info(f'Sampling {args.sample_num} examples')
-            requests = requests[:args.sample_num]
+        print(len(requests))
+        if args.sample_num < len(requests):
+            print('Sample {} Examples'.format(args.sample_num))
+        requests = requests[:args.sample_num]
 
-        # Process requests
         results = []
-        for i, request in enumerate(tqdm.tqdm(requests, desc="Processing requests")):
-            try:
-                start_time = time.time()
-                logger.debug(f"Processing request {i+1}/{len(requests)}")
-                
-                result = {'request': request['request']}
-                prompt = request['request']['prompt']
-                
-                # Check input length
-                input_ids = tokenizer(
-                    prompt, 
-                    return_tensors='pt'
-                ).input_ids.to(device)
-                
-                input_length = len(input_ids[0])
-                if input_length > FAIL_FAST_THRESHOLD:
-                    logger.warning(f"Input too long ({input_length} tokens), skipping")
-                    continue
-
-                # Calculate max new tokens
-                max_new_tokens = min(
-                    request['request']['max_tokens'],
-                    MAX_TOTAL_TOKENS - input_length
-                )
-                
-                if max_new_tokens <= 0:
-                    logger.warning(f"No room for generation after input ({input_length} tokens), skipping")
-                    continue
-
-                logger.debug(f"Input length: {input_length} tokens, generating up to {max_new_tokens} new tokens")
-                
-                # Generate with timeout
+        with torch.no_grad():
+            for i, request in enumerate(tqdm.tqdm(requests)):
                 try:
+                    start_time = time.time()
+                    request = request['request']
+                    result = {'request': request, 'result': {}}
+                    prompt = request['prompt']
+                    temperature = request['temperature']
+                    stop = request['stop']
+
+                    input_ids = tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
+
+                    # Skip if input is too long
+                    if len(input_ids[0]) > model.config.max_position_embeddings:
+                        logger.warning(f"Input too long ({len(input_ids[0])} tokens), skipping")
+                        continue
+
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     
                     with torch.inference_mode(), timeout(seconds=MAX_GENERATION_TIME):
-                        outputs = model.generate(
+                        output_sequences = model.generate(
                             input_ids=input_ids,
-                            max_new_tokens=max_new_tokens,  # Use max_new_tokens instead of max_length
-                            temperature=request['request']['temperature'],
+                            max_length=request['max_tokens'] + len(input_ids[0]),
+                            temperature=temperature,
+                            top_k=args.k,
+                            top_p=request['top_p'],
                             do_sample=True,
+                            num_return_sequences=request['n'],
                             return_dict_in_generate=True,
                             output_scores=True,
                         )
-                        
-                        # Reset masks after generation
-                        for name, m in model.named_modules():
-                            if isinstance(m, LlamaAttention_heavy_hitter):
-                                m._reset_masks()
-                                
+
+                    for name, m in model.named_modules():
+                        if isinstance(m, TAGET_MODULE[args.model_arch]):
+                            m._reset_masks()
+
+                    tokens = tokenizer.convert_ids_to_tokens(output_sequences['sequences'].squeeze(0))[len(input_ids[0]):]
+                    logprobs = [logits.log_softmax(dim=-1).max().item() for logits in output_sequences['scores']]
+                    top_logprobs = [{i: v} for i, v in zip(tokens, logprobs)]
+
+                    generate_text = tokenizer.decode(output_sequences['sequences'].squeeze(0)[len(input_ids[0]):])
+                    generate_text = generate_text[: generate_text.find(stop[0])]
+
+                    generation_time = time.time() - start_time
+
+                    result['result'] = {
+                        "choices": [{
+                            "text": generate_text,
+                            "logprobs": {
+                                "tokens": tokens,
+                                "token_logprobs": logprobs,
+                                "top_logprobs": top_logprobs,
+                                "text_offset": []
+                            },
+                            "finish_reason": "length"
+                        }],
+                        "request_time": {
+                            "batch_time": generation_time,
+                            "batch_size": 1
+                        }
+                    }
+                    results.append(result)
+
                 except TimeoutError:
                     logger.error(f"Generation timed out after {MAX_GENERATION_TIME}s")
                     if torch.cuda.is_available():
-                        torch.cuda.empty_cache()  # Clear GPU memory
+                        torch.cuda.empty_cache()
                     continue
-                
-                # Process outputs
-                tokens = tokenizer.convert_ids_to_tokens(outputs['sequences'][0])[len(input_ids[0]):]
-                logprobs = [logits.log_softmax(dim=-1).max().item() 
-                           for logits in outputs['scores']]
-
-                generation_time = time.time() - start_time
-                logger.debug(f"Generation took {generation_time:.2f}s")
-
-                result['result'] = {
-                    "choices": [{
-                        "text": tokenizer.decode(outputs['sequences'][0][len(input_ids[0]):]),
-                        "logprobs": {
-                            "tokens": tokens,
-                            "token_logprobs": logprobs,
-                            "top_logprobs": [{t: p} for t, p in zip(tokens, logprobs)],
-                            "text_offset": []
-                        },
-                        "finish_reason": "length"
-                    }],
-                    "request_time": {"batch_time": generation_time, "batch_size": 1}
-                }
-                results.append(result)
+                except Exception as e:
+                    logger.error(f"Error processing request {i}:")
+                    logger.error(f"Error type: {type(e).__name__}")
+                    logger.error(f"Error message: {str(e)}")
+                    logger.error("Full traceback:")
+                    logger.error(traceback.format_exc())
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
 
                 # Save intermediate results
                 if (i + 1) % SAVE_INTERVAL == 0:
-                    logger.debug(f"Saving intermediate results after {i+1} samples")
-                    with open(output_path, 'w') as f:
+                    with open(args.output_path, 'w') as f:
                         for result in results:
                             f.write(json.dumps(result) + '\n')
 
-            except Exception as e:
-                logger.error(f"Error processing request {i}: {str(e)}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-
         # Save final results
-        logger.info("Saving final results...")
-        with open(output_path, 'w') as f:
+        with open(args.output_path, 'w') as f:
             for result in results:
                 f.write(json.dumps(result) + '\n')
 
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
+        logger.error("Fatal error in main:")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.error("Full traceback:")
+        logger.error(traceback.format_exc())
         raise
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_path", type=str, required=True)
-    parser.add_argument("--output_path", type=str, required=True)
-    parser.add_argument("--model_name", type=str, required=True)
-    parser.add_argument("--model_arch", type=str, default="llama")
-    parser.add_argument("--cache_dir", type=str, default="./cache")
-    parser.add_argument("--heavy_ratio", type=float, default=0.1)
-    parser.add_argument("--recent_ratio", type=float, default=0.1)
-    parser.add_argument("--enable_small_cache", action="store_true")
-    parser.add_argument("--sample_num", type=int, default=100)
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
-    args = parser.parse_args()
-    
-    # Setup logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    
-    run_experiment(args)
 
 if __name__ == "__main__":
     main()

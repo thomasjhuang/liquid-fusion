@@ -1,47 +1,25 @@
 import os
-import pdb
 import copy
 import math
 import numpy as np 
-from dataclasses import dataclass
-import logging
-logger = logging.getLogger(__name__)
 from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
-import torch.utils.checkpoint
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaAttention, apply_rotary_pos_emb
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
 __all__ = ['convert_kvcache_llama_heavy_recent', 'LlamaAttention_heavy_hitter']
 
-class LlamaAttention_heavy_hitter(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.max_position_embeddings = config.max_position_embeddings
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
-
+class LlamaAttention_heavy_hitter(LlamaAttention):
+    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
+        super().__init__(config)
+        self.layer_idx = layer_idx
+        
+        # Heavy hitter specific attributes
         self.heavy_budget_ratio = config.heavy_ratio
         self.recent_budget_ratio = config.recent_ratio
         self.attention_masks_next = None 
@@ -52,27 +30,17 @@ class LlamaAttention_heavy_hitter(nn.Module):
         self.input_length = []
         self.cache_budget_records = []
 
-    def _reset_masks(self):
-        self.attention_masks_next = None 
-        self.heavy_budget = None
-        self.recent_budget = None
-        self.cache_budget = None
-        self.previous_scores = None
-
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[torch.Tensor] = None,
-        **kwargs
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -81,33 +49,37 @@ class LlamaAttention_heavy_hitter(nn.Module):
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
+        
+        # Handle DynamicCache
         if past_key_value is not None:
-            try:
-                if isinstance(past_key_value, tuple):
-                    kv_seq_len += past_key_value[0].shape[-2]
-                    key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                    value_states = torch.cat([past_key_value[1], value_states], dim=2)
-                else:
-                    past_key_states = past_key_value.get_seq_length()
-                    if past_key_states > 0:
-                        kv_seq_len += past_key_states
-                        key_states = torch.cat([past_key_value.key_cache, key_states], dim=2)
-                        value_states = torch.cat([past_key_value.value_cache, value_states], dim=2)
-            except:
-                logger.warning("Failed to process past_key_value, continuing without it")
+            past_length = 0
+            if hasattr(past_key_value, 'get_seq_length'):  # DynamicCache case
+                past_length = past_key_value.get_seq_length()
+                if past_length > 0:
+                    key_states = torch.cat([past_key_value.key_cache, key_states], dim=2)
+                    value_states = torch.cat([past_key_value.value_cache, value_states], dim=2)
+            else:  # Regular tuple case
+                past_length = past_key_value[0].shape[-2]
+                key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            kv_seq_len += past_length
 
-        # Create position IDs if not provided
-        if position_ids is None:
-            device = hidden_states.device
-            position_ids = torch.arange(0, kv_seq_len, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).view(-1, kv_seq_len)
-
-        # Get rotary embeddings using the correct method
-        cos, sin = self.rotary_emb.create_rotary_pos_emb(kv_seq_len, device=hidden_states.device)
+        # Get rotary embeddings
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        past_key_value = (key_states, value_states) if use_cache else None
+        # Update cache if needed
+        if use_cache:
+            if hasattr(past_key_value, 'update'):  # DynamicCache case
+                past_key_value.update(key_states, value_states, self.layer_idx)
+            else:  # Regular tuple case
+                past_key_value = (key_states, value_states)
 
+        # Calculate attention
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -124,25 +96,27 @@ class LlamaAttention_heavy_hitter(nn.Module):
             attn_weights = attn_weights + attention_mask
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
+        # Apply heavy hitter attention mask
         if self.attention_masks_next is not None:
             attn_weights = attn_weights * self.attention_masks_next + (1 - self.attention_masks_next) * torch.finfo(attn_weights.dtype).min
 
-        # upcast attention to fp32
+        # Upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        
+        # Calculate heavy hitter scores
+        current_scores_sum = attn_weights.sum(0).sum(1)  # (heads, k-tokens)
 
-        # attn_weights (BS, heads, q-tokens, k-tokens)
-        current_scores_sum = attn_weights.sum(0).sum(1) # (heads, k-tokens)
-
-        # Accumulate attention scores
-        if not self.previous_scores == None:
-            current_scores_sum[:, :-1] += self.previous_scores
-        else:
+        # Initialize budgets if not already set
+        if self.cache_budget is None:
             self.heavy_budget = int(self.heavy_budget_ratio * current_scores_sum.shape[-1])
             self.recent_budget = int(self.recent_budget_ratio * current_scores_sum.shape[-1])
             self.cache_budget = self.heavy_budget + self.recent_budget
             self.cache_budget_records.append(self.cache_budget)
             self.input_length.append(attn_weights.shape[-1])
 
+        if self.previous_scores is not None:
+            current_scores_sum[:, :-1] += self.previous_scores
+        
         dtype_attn_weights = attn_weights.dtype
         attn_weights_devices = attn_weights.device
         assert attn_weights.shape[0] == 1
@@ -151,16 +125,16 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         attn_tokens_all = self.previous_scores.shape[-1]
     
-        if attn_tokens_all > self.cache_budget:
-            # activate most recent k-cache
-            if not self.recent_budget == 0:
+        # Ensure cache_budget is initialized before comparison
+        if self.cache_budget is not None and attn_tokens_all > self.cache_budget:
+            if self.recent_budget > 0:
                 attn_mask[:, :-self.recent_budget] = 0
                 selected_set = self.previous_scores[:, :-self.recent_budget]
             else:
                 attn_mask[:, :] = 0
                 selected_set = self.previous_scores
 
-            if not self.heavy_budget == 0:
+            if self.heavy_budget > 0:
                 _, keep_topk = selected_set.topk(k=self.heavy_budget, dim=-1, largest=True)
                 attn_mask = attn_mask.scatter(-1, keep_topk, 1)
 
@@ -170,6 +144,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
         score_mask[:, -self.recent_budget:] = 1
         self.previous_scores = self.previous_scores * score_mask
 
+        # Calculate output
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -178,9 +153,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
                 f" {attn_output.size()}"
             )
 
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -191,7 +164,14 @@ class LlamaAttention_heavy_hitter(nn.Module):
 def convert_kvcache_llama_heavy_recent(model, config):
     for name, module in reversed(model._modules.items()):
         if len(list(module.children())) > 0:
+            # Get layer index from name if it exists
+            layer_idx = None
+            if 'layers.' in name:
+                try:
+                    layer_idx = int(name.split('layers.')[-1].split('.')[0])
+                except:
+                    pass
             model._modules[name] = convert_kvcache_llama_heavy_recent(module, config)
         if isinstance(module, LlamaAttention):
-            model._modules[name] = LlamaAttention_heavy_hitter(config)
+            model._modules[name] = LlamaAttention_heavy_hitter(config, layer_idx)
     return model
