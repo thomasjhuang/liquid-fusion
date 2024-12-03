@@ -2,6 +2,7 @@ import argparse
 import logging
 import torch
 import json
+import os
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from models.utils_hh.modify_llama import convert_kvcache_llama_heavy_recent
 
@@ -12,7 +13,16 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
+def get_repo_root():
+    """Get the absolute path to the repository root."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def run_experiment(args):
+
+    repo_root = get_repo_root()
+    input_path = os.path.join(repo_root, args.input_path)
+    output_path = os.path.join(repo_root, args.output_path)
+
     device = get_device()
     logger.info(f"Using device: {device}")
 
@@ -49,7 +59,7 @@ def run_experiment(args):
 
     # Load requests
     requests = []
-    with open(args.input_path, 'r') as f:
+    with open(input_path, 'r') as f:
         for line in f:
             if line.strip():
                 requests.append(json.loads(line))
@@ -96,7 +106,7 @@ def run_experiment(args):
         results.append(result)
 
     # Save results
-    with open(args.output_path, 'w') as f:
+    with open(output_path, 'w') as f:
         for result in results:
             f.write(json.dumps(result) + '\n')
 
