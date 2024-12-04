@@ -38,8 +38,6 @@ def save_results_to_file(results: list, config: BenchmarkConfig):
     except Exception as e:
         print(f"Error saving results: {str(e)}")
 
-# Local imports
-
 def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: bool = True):
     """Run benchmarks with given configuration."""
     def log(*args, **kwargs):
@@ -50,115 +48,87 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
     device = torch.device(config.device)
     
     try:
-        # Check memory at start
-        detailed_memory_check("Before Benchmark")
-        
-        # Aggressive cleanup before starting
-        aggressive_memory_cleanup()
-        
-        # Safer memory clearing
-        try:
-            if torch.cuda.is_available():
-                # Reset peak memory stats
-                torch.cuda.reset_peak_memory_stats()
-                # Safer empty cache
-                with torch.cuda.device(device):
-                    torch.cuda.empty_cache()
-            gc.collect()
-        except RuntimeError as e:
-            log(f"Warning: Memory cleanup error (non-critical): {e}")
-        
-        # Set memory allocation strategy more conservatively
-        if device.type == "cuda":
-            torch.cuda.set_per_process_memory_fraction(0.8)  # Reduced from 0.9
-            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
+        # Simple cleanup before starting
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            # Allow for more aggressive memory usage
+            torch.cuda.set_per_process_memory_fraction(0.95)  # Increased from 0.8
+            # Configure PyTorch memory allocator
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
+        gc.collect()
         
         # Load model and tokenizer
         log("\nInitializing components...")
         model_loader = ModelLoader(config)
         
-        # Use mixed precision more explicitly
-        dtype = torch.float16 if device.type == "cuda" else torch.float32
         with torch.cuda.amp.autocast():
             model, tokenizer = model_loader.load_model_and_tokenizer()
-            model = model.to(device).to(dtype)
+            model = model.to(device)
             
             dataset_manager = DatasetManager(config, tokenizer)
             
-            if config.attention_type != "default":
-                log(f"\nConverting attention mechanism to {config.attention_type}...")
-                if config.attention_type == "streaming":
-                    model.config.window_size = config.window_size
-                    model.config.sink_size = config.sink_size
-                    model.config.sink_update_rate = config.sink_update_rate
-                    model = convert_to_streaming_attention(model, model.config)
-                log("Attention mechanism converted successfully")
-        
-        # Process datasets
-        for dataset_config in config.datasets:
-            for split in dataset_config.splits:
-                log(f"\nTesting {dataset_config.name} ({split})")
-                try:
-                    dataset = dataset_manager.load_dataset(
-                        dataset_config.name, 
-                        split,
-                        batch_size=1
-                    )
-                    
-                    if dataset is None:
-                        log(f"Skipping {dataset_config.name} - failed to load")
+            # Process datasets
+            for dataset_config in config.datasets:
+                for split in dataset_config.splits:
+                    log(f"\nTesting {dataset_config.name} ({split})")
+                    try:
+                        dataset = dataset_manager.load_dataset(
+                            dataset_config.name, 
+                            split,
+                            batch_size=1
+                        )
+                        
+                        if dataset is None:
+                            log(f"Skipping {dataset_config.name} - failed to load")
+                            continue
+                        
+                        for batch in tqdm(dataset, desc="Processing examples"):
+                            try:
+                                if device.type == "cuda":
+                                    torch.cuda.empty_cache()
+                                
+                                with torch.cuda.amp.autocast():
+                                    with torch.no_grad():
+                                        input_ids = batch['input_ids'].to(device)
+                                        attention_mask = batch['attention_mask'].to(device)
+                                        input_text = batch['text']
+                                        
+                                        start_time = time.time()
+                                        outputs = model.generate(
+                                            input_ids,
+                                            attention_mask=attention_mask,
+                                            max_new_tokens=min(config.max_tokens, 128),
+                                            do_sample=True,
+                                            temperature=config.temperature,
+                                            return_dict_in_generate=True,
+                                            output_scores=True,
+                                            pad_token_id=tokenizer.pad_token_id
+                                        )
+                                        
+                                        result = process_outputs(outputs, input_text, tokenizer, start_time, config, device)
+                                        results.append(result)
+                                
+                                # Cleanup after each batch
+                                del outputs, input_ids, attention_mask
+                                
+                            except RuntimeError as e:
+                                if "out of memory" in str(e):
+                                    log(f"OOM error, attempting recovery")
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    continue
+                                raise e
+                                    
+                    except Exception as e:
+                        log(f"Error testing {dataset_config.name}: {str(e)}")
                         continue
                     
-                    for batch in tqdm(dataset, desc="Processing examples"):
-                        try:
-                            if device.type == "cuda":
-                                with torch.cuda.device(device):
-                                    torch.cuda.empty_cache()
-                            
-                            with torch.cuda.amp.autocast():
-                                with torch.no_grad():
-                                    input_ids = batch['input_ids'].to(device)
-                                    attention_mask = batch['attention_mask'].to(device)
-                                    input_text = batch['text']
-                                    
-                                    start_time = time.time()
-                                    outputs = model.generate(
-                                        input_ids,
-                                        attention_mask=attention_mask,
-                                        max_new_tokens=min(config.max_tokens, 128),
-                                        do_sample=True,
-                                        temperature=config.temperature,
-                                        return_dict_in_generate=True,
-                                        output_scores=True,
-                                        pad_token_id=tokenizer.pad_token_id
-                                    )
-                                    
-                                    result = process_outputs(outputs, input_text, tokenizer, start_time, config, device)
-                                    results.append(result)
-                                    
-                            # Explicit cleanup after each batch
-                            del outputs
-                            del input_ids
-                            del attention_mask
-                            
-                        except RuntimeError as e:
-                            if "out of memory" in str(e):
-                                log(f"OOM error, attempting recovery: {str(e)}")
-                                if torch.cuda.is_available():
-                                    with torch.cuda.device(device):
-                                        torch.cuda.empty_cache()
-                                continue
-                            raise e
-                                
-                except Exception as e:
-                    log(f"Error testing {dataset_config.name}: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-                
     finally:
-        # Cleanup at end
-        aggressive_memory_cleanup(model if 'model' in locals() else None)
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
     
     if save_results and results:
         save_results_to_file(results, config)
@@ -404,10 +374,8 @@ def aggressive_memory_cleanup(model=None):
 
 def deep_memory_cleanup(model=None, verbose=False):
     """Comprehensive memory cleanup including model weights, CUDA cache, and system memory."""
-    if verbose:
-        print("Cleaning up memory...")
+    print("Cleaning up memory...")
     
-    # 1. Clear model and its weights if provided
     if model is not None:
         try:
             model.cpu()
@@ -421,16 +389,11 @@ def deep_memory_cleanup(model=None, verbose=False):
         except Exception:
             pass
     
-    # 2. Clear CUDA memory
     if torch.cuda.is_available():
-        try:
-            for i in range(torch.cuda.device_count()):
-                with torch.cuda.device(i):
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats()
-        except Exception:
-            pass
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
     
-    # 3. Multiple GC runs
     for _ in range(5):
         gc.collect()

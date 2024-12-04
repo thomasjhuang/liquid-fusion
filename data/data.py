@@ -46,6 +46,10 @@ class ModelDataset(Dataset):
             elif 'text' in item:
                 text = item['text']
                 target = ''
+            elif 'premise' in item and 'choice1' in item:  # COPA format
+                choices = f"1. {item['choice1']}\n2. {item['choice2']}"
+                text = f"Premise: {item['premise']}\nQuestion: {item['question']}\nChoices:\n{choices}"
+                target = str(item.get('label', ''))  # COPA target
             else:
                 raise ValueError(f"Unknown dataset format with keys: {item.keys()}")
         else:
