@@ -5,6 +5,7 @@ import time
 import torch.nn.functional as F
 import torch
 from tqdm import tqdm
+from rouge_score import rouge_scorer
 
 # Local imports
 from data.config import BenchmarkConfig
@@ -18,6 +19,9 @@ from models.attention.streaming import convert_to_streaming_attention
 
 import gc
 import os
+import copy
+import psutil
+from collections import defaultdict
 
 def save_results_to_file(results: list, config: BenchmarkConfig):
     """Save benchmark results to a JSON file."""
@@ -45,6 +49,12 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
     device = torch.device(config.device)
     
     try:
+        # Check memory at start
+        detailed_memory_check("Before Benchmark")
+        
+        # Aggressive cleanup before starting
+        aggressive_memory_cleanup()
+        
         # Safer memory clearing
         try:
             if torch.cuda.is_available():
@@ -146,17 +156,8 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
                     continue
                 
     finally:
-        # Safer cleanup
-        try:
-            if 'model' in locals():
-                model.cpu()
-                del model
-            if torch.cuda.is_available():
-                with torch.cuda.device(device):
-                    torch.cuda.empty_cache()
-            gc.collect()
-        except Exception as e:
-            log(f"Warning: Final cleanup error (non-critical): {e}")
+        # Cleanup at end
+        aggressive_memory_cleanup(model if 'model' in locals() else None)
     
     if save_results and results:
         save_results_to_file(results, config)
@@ -228,71 +229,44 @@ def run_attention_strategy_comparison(config, cache_sizes=[100, 80, 60, 20, 10, 
     
     base_config = copy.deepcopy(config)
     
-    for strategy in comparison_results.keys():
-        print(f"\nTesting {strategy} strategy...")
-        
-        for cache_size in cache_sizes:
-            # Skip unnecessary full cache variations
-            if strategy == 'full' and cache_size != 100:
-                continue
+    # Load model once and reuse
+    model_loader = ModelLoader(base_config)
+    base_model, tokenizer = model_loader.load_model_and_tokenizer()
+    
+    try:
+        for strategy in comparison_results.keys():
+            print(f"\nTesting {strategy} strategy...")
+            deep_memory_cleanup()  # Clean between strategies
+            
+            for cache_size in cache_sizes:
+                if strategy == 'full' and cache_size != 100:
+                    continue
+                    
+                print(f"Testing with {cache_size}% cache budget")
+                model = copy.deepcopy(base_model)
                 
-            print(f"Testing with {cache_size}% cache budget")
-            
-            # Update config for current test
-            current_config = copy.deepcopy(base_config)
-            current_config.kv_cache_budget = cache_size
-            
-            # Configure model based on strategy
-            if strategy == 'h2o':
-                # H2O configuration
-                current_config.heavy_ratio = 0.5
-                current_config.recent_ratio = 0.5
-                model = convert_kvcache_llama_heavy_recent(current_config.model, current_config)
-            
-            elif strategy == 'liquid_fusion':
-                # Liquid Fusion configuration
-                current_config.sink_size = 4  # Small number of sink tokens
-                current_config.heavy_ratio = 0.3  # 30% for heavy hitters
-                current_config.recent_ratio = 0.3  # 30% for recent tokens
-                current_config.sink_update_rate = 0.1  # EMA rate for sink updates
-                model = convert_to_liquid_fusion(current_config.model, current_config)
-            
-            elif strategy == 'streaming':
-                # StreamingLLM configuration
-                current_config.window_size = int(current_config.model.config.max_position_embeddings * (cache_size/100))
-                current_config.sink_size = min(32, current_config.window_size // 8)
-                model = convert_to_streaming_attention(current_config.model, current_config)
-            
-            elif strategy == 'local':
-                # Local attention (only recent tokens)
-                current_config.recent_ratio = 1.0
-                current_config.heavy_ratio = 0.0
-                model = convert_kvcache_llama_heavy_recent(current_config.model, current_config)
-            
-            # Run benchmark
-            try:
-                results = run_benchmark(current_config, save_results=False, verbose=False)
-                
-                # Calculate metrics
-                rouge_scores = calculate_rouge_scores(results, current_config.reference_texts)
-                throughput = calculate_throughput(results)
-                memory_usage = measure_memory_usage()
-                
-                comparison_results[strategy][cache_size] = {
-                    **rouge_scores,
-                    'throughput': throughput,
-                    'memory': memory_usage
-                }
-                
-            except Exception as e:
-                print(f"Error testing {strategy} with {cache_size}% cache: {str(e)}")
-                continue
-            
-            # Clear memory
-            if 'model' in locals():
-                del model
-            torch.cuda.empty_cache()
-            gc.collect()
+                try:
+                    results = run_benchmark(current_config, save_results=False, verbose=False)
+                    
+                    # Calculate metrics
+                    rouge_scores = calculate_rouge_scores(results, current_config.reference_texts)
+                    throughput = calculate_throughput(results)
+                    memory_usage = measure_memory_usage()
+                    
+                    comparison_results[strategy][cache_size] = {
+                        **rouge_scores,
+                        'throughput': throughput,
+                        'memory': memory_usage
+                    }
+                    
+                except Exception as e:
+                    print(f"Error testing {strategy} with {cache_size}% cache: {str(e)}")
+                    continue
+                    
+                finally:
+                    deep_memory_cleanup(model)  # Ensure cleanup happens
+    finally:
+        deep_memory_cleanup(base_model)  # Final cleanup
     
     return comparison_results
 
@@ -344,3 +318,209 @@ def measure_memory_usage():
     if torch.cuda.is_available():
         return torch.cuda.max_memory_allocated() / 1024**3  # Convert to GB
     return 0
+
+def calculate_rouge_scores(results, reference_texts=None):
+    """Calculate ROUGE scores for generated texts"""
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    scores = {'rouge1': 0, 'rouge2': 0, 'rougeL': 0}
+    
+    for result in results:
+        generated = result['result']['choices'][0]['text']
+        reference = result['request']['prompt'].split('Summary: ')[-1]
+        
+        # Calculate scores
+        score = scorer.score(reference, generated)
+        scores['rouge1'] += score['rouge1'].fmeasure
+        scores['rouge2'] += score['rouge2'].fmeasure
+        scores['rougeL'] += score['rougeL'].fmeasure
+    
+    # Average scores
+    n = len(results)
+    return {k: v/n for k, v in scores.items()}
+
+def detailed_memory_check(label=""):
+    """Detailed memory analysis with tensor tracking"""
+    print(f"\n=== DETAILED MEMORY ANALYSIS: {label} ===")
+    
+    # 1. CUDA Memory
+    if torch.cuda.is_available():
+        print("\nCUDA Memory Breakdown:")
+        device = torch.cuda.current_device()
+        
+        print(f"Allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+        print(f"Cached: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
+        print(f"Max Allocated: {torch.cuda.max_memory_allocated(device) / 1024**3:.2f} GB")
+        
+        # Get memory stats for each GPU
+        for i in range(torch.cuda.device_count()):
+            print(f"\nGPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"Memory used: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
+    
+    # 2. Tensor Analysis
+    print("\nTensor Memory Analysis:")
+    tensor_count = defaultdict(int)
+    tensor_memory = defaultdict(int)
+    
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                key = f"{obj.device}_{obj.dtype}"
+                tensor_count[key] += 1
+                tensor_memory[key] += obj.element_size() * obj.nelement()
+                
+                # Print large tensors (>100MB)
+                if obj.element_size() * obj.nelement() > 100 * 1024 * 1024:
+                    print(f"\nLarge tensor found:")
+                    print(f"Size: {obj.element_size() * obj.nelement() / 1024**3:.2f} GB")
+                    print(f"Shape: {obj.shape}")
+                    print(f"Device: {obj.device}")
+                    print(f"Dtype: {obj.dtype}")
+        except Exception:
+            continue
+    
+    print("\nTensor Summary:")
+    for key in tensor_count:
+        print(f"{key}:")
+        print(f"  Count: {tensor_count[key]}")
+        print(f"  Memory: {tensor_memory[key] / 1024**3:.2f} GB")
+    
+    # 3. System Memory
+    process = psutil.Process()
+    print(f"\nSystem Memory:")
+    print(f"RSS: {process.memory_info().rss / 1024**3:.2f} GB")
+    print(f"VMS: {process.memory_info().vms / 1024**3:.2f} GB")
+
+def aggressive_memory_cleanup(model=None):
+    """Aggressively clean up memory"""
+    print("\nStarting aggressive memory cleanup...")
+    
+    detailed_memory_check("Before Cleanup")
+    
+    # 1. Clear model
+    if model is not None:
+        try:
+            model.cpu()
+            del model
+        except:
+            print("Error clearing model")
+    
+    # 2. Clear CUDA cache multiple times
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+        except Exception as e:
+            print(f"CUDA cleanup error: {e}")
+    
+    # 3. Clear all tensors
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                if obj.is_cuda:
+                    obj.cpu()
+                del obj
+        except:
+            continue
+    
+    # 4. Multiple GC runs
+    for _ in range(3):
+        gc.collect()
+    
+    # 5. Clear CUDA cache again
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    detailed_memory_check("After Cleanup")
+    
+    print("\nMemory cleanup completed")
+
+def deep_memory_cleanup(model=None, verbose=True):
+    """Comprehensive memory cleanup including model weights, CUDA cache, and system memory."""
+    if verbose:
+        print("\n=== Starting Deep Memory Cleanup ===")
+        
+        # Initial memory check
+        if torch.cuda.is_available():
+            print("\nInitial CUDA Memory:")
+            device = torch.cuda.current_device()
+            print(f"Allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+            print(f"Cached: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
+            print(f"Max Allocated: {torch.cuda.max_memory_allocated(device) / 1024**3:.2f} GB")
+    
+    # 1. Clear model and its weights if provided
+    if model is not None:
+        try:
+            # Move model to CPU and clear its memory
+            model.cpu()
+            for param in model.parameters():
+                if hasattr(param, 'data'):
+                    param.data = None
+                if hasattr(param, 'grad'):
+                    param.grad = None
+            
+            # Clear buffers and caches
+            for buffer in model.buffers():
+                if hasattr(buffer, 'data'):
+                    buffer.data = None
+            
+            if hasattr(model, 'past_key_values'):
+                model.past_key_values = None
+            
+            # Clear state dict and delete model
+            model.state_dict().clear()
+            del model
+        except Exception as e:
+            if verbose:
+                print(f"Warning during model clearing: {e}")
+    
+    # 2. Clear all remaining tensors and CUDA storage
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                if obj.is_cuda:
+                    obj.cpu()
+                obj.data = None
+                del obj
+            elif hasattr(obj, 'storage') and hasattr(obj.storage, '_cuda_storage'):
+                obj.storage._cuda_storage = None
+        except:
+            continue
+    
+    # 3. Clear CUDA memory if available
+    if torch.cuda.is_available():
+        try:
+            # Multiple passes of cache clearing for each device
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    for _ in range(3):
+                        torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+            
+            # Reset memory allocator
+            if hasattr(torch.cuda.memory, '_reset_memory_allocator'):
+                torch.cuda.memory._reset_memory_allocator()
+        except Exception as e:
+            if verbose:
+                print(f"Error during CUDA cleanup: {e}")
+    
+    # 4. Multiple GC runs
+    for _ in range(5):
+        gc.collect()
+    
+    # 5. Final memory check if verbose
+    if verbose:
+        print("\nFinal Memory Status:")
+        if torch.cuda.is_available():
+            print(f"Allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+            print(f"Cached: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
+        
+        # System memory
+        process = psutil.Process()
+        print(f"System RSS: {process.memory_info().rss / 1024**3:.2f} GB")
+        print("\n=== Memory Cleanup Completed ===")
+    
+    return None
