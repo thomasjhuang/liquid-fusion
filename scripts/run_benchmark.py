@@ -4,6 +4,7 @@ from typing import Dict
 import time
 import torch.nn.functional as F
 import torch
+from tqdm import tqdm
 
 # Local imports
 from data.config import BenchmarkConfig
@@ -16,6 +17,7 @@ from models.h2o.h2o_llama import convert_kvcache_llama_heavy_recent
 from models.attention.streaming import convert_to_streaming_attention
 
 import gc
+import os
 
 def save_results_to_file(results: list, config: BenchmarkConfig):
     """Save benchmark results to a JSON file."""
@@ -33,66 +35,49 @@ def save_results_to_file(results: list, config: BenchmarkConfig):
 
 # Local imports
 
-def run_benchmark(config: BenchmarkConfig, 
-                 save_results: bool = True,
-                 verbose: bool = True) -> dict:
+def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: bool = True):
     """Run benchmarks with given configuration."""
     def log(*args, **kwargs):
         if verbose:
             print(*args, **kwargs)
     
     results = []
+    device = torch.device(config.device)
     
-    # Initialize components with memory management
-    log("\nInitializing components...")
     try:
-        # Clear memory before loading model
+        # Clear memory before starting
         gc.collect()
         torch.cuda.empty_cache()
         
-        # Load model with memory optimizations
+        # Set memory allocation strategy
+        if device.type == "cuda":
+            torch.cuda.set_per_process_memory_fraction(0.9)
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+        
+        # Load model and tokenizer
+        log("\nInitializing components...")
         model_loader = ModelLoader(config)
-        model, tokenizer = model_loader.load_model_and_tokenizer()
-        
-        # Convert attention mechanism based on config
-        if config.attention_type != "default":
-            log(f"\nConverting attention mechanism to {config.attention_type}...")
+        with torch.cuda.amp.autocast():
+            model, tokenizer = model_loader.load_model_and_tokenizer()
+            model = model.to(device)
             
-            if config.attention_type == "h2o":
-                # Set H2O specific config parameters
-                model.config.heavy_ratio = config.heavy_ratio
-                model.config.recent_ratio = config.recent_ratio
-                model = convert_kvcache_llama_heavy_recent(model, model.config)
-            elif config.attention_type == "streaming":
-                # Set streaming specific config parameters
-                model.config.window_size = config.window_size
-                model.config.sink_size = config.sink_size
-                model.config.sink_update_rate = config.sink_update_rate
-                model = convert_to_streaming_attention(model, model.config)
-            else:
-                # Set sparse attention specific config parameters
-                model.config.window_size = config.window_size
-                if config.attention_type == "sparse_strided":
-                    model.config.stride = config.stride
-                model = convert_attention_type(model, config.attention_type, model.config)
+            # Initialize dataset manager with tokenizer
+            dataset_manager = DatasetManager(config, tokenizer)
             
-            log("Attention mechanism converted successfully")
+            if config.attention_type != "default":
+                log(f"\nConverting attention mechanism to {config.attention_type}...")
+                if config.attention_type == "streaming":
+                    model.config.window_size = config.window_size
+                    model.config.sink_size = config.sink_size
+                    model.config.sink_update_rate = config.sink_update_rate
+                    model = convert_to_streaming_attention(model, model.config)
+                log("Attention mechanism converted successfully")
         
-        # Enable memory efficient options
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        
-        # Process datasets one at a time
+        # Process datasets
         for dataset_config in config.datasets:
             for split in dataset_config.splits:
                 log(f"\nTesting {dataset_config.name} ({split})")
                 try:
-                    # Clear memory before loading each dataset
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    
-                    # Initialize dataset manager for just this dataset
-                    dataset_manager = DatasetManager(config, tokenizer)
                     dataset = dataset_manager.load_dataset(
                         dataset_config.name, 
                         split,
@@ -103,52 +88,38 @@ def run_benchmark(config: BenchmarkConfig,
                         log(f"Skipping {dataset_config.name} - failed to load")
                         continue
                     
-                    # Process each example
-                    for batch in dataset:
-                        start_time = time.time()
+                    for batch in tqdm(dataset, desc="Processing examples"):
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                         
-                        # Move batch to GPU efficiently
-                        input_text = batch['text']
-                        input_ids = batch['input_ids'].to(model.device, non_blocking=True)
-                        attention_mask = batch['attention_mask'].to(model.device, non_blocking=True)
-                        
-                        # Generate with memory optimization
-                        with torch.no_grad(), torch.cuda.amp.autocast():
-                            current_length = input_ids.shape[1]
-                            max_new_tokens = min(
-                                config.max_tokens,
-                                model.config.max_position_embeddings - current_length
-                            )
-                            
-                            outputs = model.generate(
-                                input_ids,
-                                attention_mask=attention_mask,
-                                max_new_tokens=max_new_tokens,
-                                do_sample=True,
-                                temperature=config.temperature,
-                                return_dict_in_generate=True,
-                                output_scores=True,
-                                pad_token_id=tokenizer.pad_token_id,
-                                return_legacy_cache=True
-                            )
-                        
-                        # Process results and clear memory
-                        result = process_outputs(outputs, input_text, tokenizer, start_time, config)
-                        results.append(result)
-                        
-                        # Clear memory after each generation
-                        del outputs
-                        torch.cuda.empty_cache()
-                        
+                        with torch.cuda.amp.autocast():
+                            with torch.no_grad():
+                                input_ids = batch['input_ids'].to(device)
+                                attention_mask = batch['attention_mask'].to(device)
+                                input_text = batch['text']
+                                
+                                start_time = time.time()
+                                outputs = model.generate(
+                                    input_ids,
+                                    attention_mask=attention_mask,
+                                    max_new_tokens=min(config.max_tokens, 128),
+                                    do_sample=True,
+                                    temperature=config.temperature,
+                                    return_dict_in_generate=True,
+                                    output_scores=True,
+                                    pad_token_id=tokenizer.pad_token_id
+                                )
+                                
+                                result = process_outputs(outputs, input_text, tokenizer, start_time, config, device)
+                                results.append(result)
+                                del outputs
+                                
                 except Exception as e:
                     log(f"Error testing {dataset_config.name}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
                     continue
                 
-                # Clear dataset from memory
-                del dataset
-                gc.collect()
-                torch.cuda.empty_cache()
-        
     finally:
         # Clean up
         if 'model' in locals():
@@ -156,29 +127,29 @@ def run_benchmark(config: BenchmarkConfig,
         gc.collect()
         torch.cuda.empty_cache()
     
-    # Save results if requested
     if save_results and results:
         save_results_to_file(results, config)
     
     return results
 
-def process_outputs(outputs, input_text, tokenizer, start_time, config):
+def process_outputs(outputs, input_text, tokenizer, start_time, config, device):
     """Process model outputs into result format"""
-    generated_tokens = outputs.sequences[0, -config.max_tokens:]
-    tokens = tokenizer.convert_ids_to_tokens(generated_tokens)
+    generated_tokens = outputs.sequences[0, -config.max_tokens:].detach()
+    tokens = tokenizer.convert_ids_to_tokens(generated_tokens.cpu())
     
     # Calculate log probabilities
     logprobs = []
     top_logprobs = []
     for logits in outputs.scores:
-        probs = F.softmax(logits[0], dim=-1)
+        logits = logits[0].detach()  # Detach from computation graph
+        probs = F.softmax(logits, dim=-1)
         log_probs = torch.log(probs)
         top_prob, top_idx = probs.max(dim=-1)
-        logprobs.append(log_probs[top_idx].item())
-        top_token = tokenizer.convert_ids_to_tokens(top_idx.item())
-        top_logprobs.append({top_token: log_probs[top_idx].item()})
+        logprobs.append(log_probs[top_idx].cpu().item())
+        top_token = tokenizer.convert_ids_to_tokens(top_idx.cpu().item())
+        top_logprobs.append({top_token: log_probs[top_idx].cpu().item()})
     
-    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    generated_text = tokenizer.decode(generated_tokens.cpu(), skip_special_tokens=True)
     generation_time = time.time() - start_time
     
     return {

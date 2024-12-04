@@ -35,28 +35,48 @@ def get_default_dataset_configs() -> Dict[str, DatasetConfig]:
 
 @dataclass
 class BenchmarkConfig:
-    model_name: str
-    model_type: str
-    attention_type: str = "default"  # Options: "default", "h2o", "sparse_fixed", "sparse_strided", "streaming"
-    
-    # General parameters
-    max_tokens: int = 128
-    temperature: float = 0.7
-    
-    # Dataset configuration
-    datasets: List[DatasetConfig] = None
-    
-    # Sparse attention parameters
-    window_size: Optional[int] = None
-    stride: Optional[int] = None
-    
-    # H2O attention parameters
-    heavy_ratio: Optional[float] = None
-    recent_ratio: Optional[float] = None
-    
-    # Streaming attention parameters
-    sink_size: Optional[int] = None
-    sink_update_rate: Optional[float] = None
+    def __init__(
+        self,
+        model_name: str,
+        model_type: str,
+        attention_type: str = "default",
+        # General parameters
+        max_tokens: int = 128,
+        temperature: float = 0.7,
+        dtype: str = "float16",
+        device: str = "cuda",
+        sequence_length: int = 512,
+        
+        # Dataset configuration
+        datasets: List[DatasetConfig] = None,
+        
+        # Sparse attention parameters
+        window_size: Optional[int] = None,
+        stride: Optional[int] = None,
+        
+        # H2O attention parameters
+        heavy_ratio: Optional[float] = None,
+        recent_ratio: Optional[float] = None,
+        
+        # Streaming attention parameters
+        sink_size: Optional[int] = None,
+        sink_update_rate: Optional[float] = None
+    ):
+        self.model_name = model_name
+        self.model_type = model_type
+        self.attention_type = attention_type
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.dtype = dtype
+        self.device = device
+        self.sequence_length = sequence_length
+        self.datasets = datasets
+        self.window_size = window_size
+        self.stride = stride
+        self.heavy_ratio = heavy_ratio
+        self.recent_ratio = recent_ratio
+        self.sink_size = sink_size
+        self.sink_update_rate = sink_update_rate
 
     def switch_dataset(self, dataset_name: str):
         """Switch datasets based on a string identifier."""
