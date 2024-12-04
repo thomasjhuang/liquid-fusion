@@ -208,3 +208,139 @@ def process_outputs(outputs, input_text, tokenizer, start_time, config, device):
         }
     }
 
+
+def run_attention_strategy_comparison(config, cache_sizes=[100, 80, 60, 20, 10, 4]):
+    """
+    Run benchmarks comparing different attention strategies:
+    - Full Attention (baseline)
+    - Local Attention (simple windowing)
+    - Heavy Hitter Oracle (H2O)
+    - Liquid Fusion (combines sink tokens with heavy hitters)
+    - Streaming LLM (attention sink mechanism)
+    """
+    comparison_results = {
+        'full': {},
+        'local': {},
+        'h2o': {},
+        'liquid_fusion': {},
+        'streaming': {}
+    }
+    
+    base_config = copy.deepcopy(config)
+    
+    for strategy in comparison_results.keys():
+        print(f"\nTesting {strategy} strategy...")
+        
+        for cache_size in cache_sizes:
+            # Skip unnecessary full cache variations
+            if strategy == 'full' and cache_size != 100:
+                continue
+                
+            print(f"Testing with {cache_size}% cache budget")
+            
+            # Update config for current test
+            current_config = copy.deepcopy(base_config)
+            current_config.kv_cache_budget = cache_size
+            
+            # Configure model based on strategy
+            if strategy == 'h2o':
+                # H2O configuration
+                current_config.heavy_ratio = 0.5
+                current_config.recent_ratio = 0.5
+                model = convert_kvcache_llama_heavy_recent(current_config.model, current_config)
+            
+            elif strategy == 'liquid_fusion':
+                # Liquid Fusion configuration
+                current_config.sink_size = 4  # Small number of sink tokens
+                current_config.heavy_ratio = 0.3  # 30% for heavy hitters
+                current_config.recent_ratio = 0.3  # 30% for recent tokens
+                current_config.sink_update_rate = 0.1  # EMA rate for sink updates
+                model = convert_to_liquid_fusion(current_config.model, current_config)
+            
+            elif strategy == 'streaming':
+                # StreamingLLM configuration
+                current_config.window_size = int(current_config.model.config.max_position_embeddings * (cache_size/100))
+                current_config.sink_size = min(32, current_config.window_size // 8)
+                model = convert_to_streaming_attention(current_config.model, current_config)
+            
+            elif strategy == 'local':
+                # Local attention (only recent tokens)
+                current_config.recent_ratio = 1.0
+                current_config.heavy_ratio = 0.0
+                model = convert_kvcache_llama_heavy_recent(current_config.model, current_config)
+            
+            # Run benchmark
+            try:
+                results = run_benchmark(current_config, save_results=False, verbose=False)
+                
+                # Calculate metrics
+                rouge_scores = calculate_rouge_scores(results, current_config.reference_texts)
+                throughput = calculate_throughput(results)
+                memory_usage = measure_memory_usage()
+                
+                comparison_results[strategy][cache_size] = {
+                    **rouge_scores,
+                    'throughput': throughput,
+                    'memory': memory_usage
+                }
+                
+            except Exception as e:
+                print(f"Error testing {strategy} with {cache_size}% cache: {str(e)}")
+                continue
+            
+            # Clear memory
+            if 'model' in locals():
+                del model
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+    return comparison_results
+
+def plot_comparison_metrics(results, metric='rouge1', title=None):
+    """Create visualizations comparing different strategies across multiple metrics."""
+    plt.figure(figsize=(12, 7))
+    
+    # Define consistent colors and markers for each strategy
+    style_dict = {
+        'full': ('blue', 'o', 'Full'),
+        'local': ('red', 's', 'Local'),
+        'h2o': ('green', '^', 'H2O'),
+        'liquid_fusion': ('purple', 'D', 'Liquid Fusion'),
+        'streaming': ('orange', 'v', 'StreamingLLM')
+    }
+    
+    for strategy, measurements in results.items():
+        cache_sizes = sorted(measurements.keys())
+        scores = [measurements[size][metric] for size in cache_sizes]
+        
+        color, marker, label = style_dict[strategy]
+        plt.plot(cache_sizes, scores, 
+                marker=marker,
+                color=color,
+                label=label,
+                linewidth=2,
+                markersize=8,
+                markeredgecolor='black',
+                markeredgewidth=1)
+    
+    plt.xlabel('KV Cache Budget (%)')
+    plt.ylabel(f'{metric.upper()} Score')
+    plt.title(title or f'{metric.upper()} vs KV Cache Budget')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    
+    return plt
+
+# Helper functions for additional metrics
+def calculate_throughput(results):
+    """Calculate average tokens/second"""
+    total_time = sum(r['result']['request_time']['batch_time'] for r in results)
+    total_tokens = sum(len(r['result']['choices'][0]['logprobs']['tokens']) for r in results)
+    return total_tokens / total_time
+
+def measure_memory_usage():
+    """Measure GPU memory usage"""
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / 1024**3  # Convert to GB
+    return 0
