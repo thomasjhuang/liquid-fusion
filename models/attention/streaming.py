@@ -14,13 +14,28 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
+    """Apply rotary position embeddings to input x."""
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    x_embed = (x * cos) + (rotate_half(x) * sin)
-    return x_embed
+    
+    # Make sure position_ids is 2D
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    
+    # Get rotary embeddings for the requested positions
+    cos = cos[position_ids]  # [bs, seq_len, dim]
+    sin = sin[position_ids]  # [bs, seq_len, dim]
+    
+    # Add head dimension
+    cos = cos.unsqueeze(1)  # [bs, 1, seq_len, dim]
+    sin = sin.unsqueeze(1)  # [bs, 1, seq_len, dim]
+    
+    # Make sure dimensions match
+    cos = cos[:, :, :x.size(-2), :]  # Truncate or pad sequence length
+    sin = sin[:, :, :x.size(-2), :]  # Truncate or pad sequence length
+    
+    return (x * cos) + (rotate_half(x) * sin)
 
 class StreamingAttention(LlamaAttention):
     """Streaming attention with sink tokens, based on StreamingLLM paper"""
@@ -55,12 +70,43 @@ class StreamingAttention(LlamaAttention):
         if past_key_value is not None and isinstance(past_key_value, DynamicCache):
             kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         
-        # Apply rotary embeddings
+        # Fix position handling for rotary embeddings
         cos, sin = self.rotary_emb(value_states, position_ids)
         
-        # Apply position-shifted rotary embeddings
-        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+        # Ensure position_ids are properly aligned with the window size
+        if past_key_value is not None and isinstance(past_key_value, DynamicCache):
+            past_length = past_key_value.get_seq_length(self.layer_idx)
+            # Ensure positions are continuous and properly offset
+            position_ids = position_ids + past_length
+            
+            # Handle key positions separately
+            key_position_ids = torch.arange(
+                past_length, 
+                past_length + key_states.size(-2), 
+                device=position_ids.device
+            )
+            
+            if key_position_ids.size(0) > self.window_size:
+                # Create proper sink token positions that maintain relative positions
+                sink_positions = torch.arange(
+                    0, self.sink_size, 
+                    device=position_ids.device
+                )
+                recent_positions = torch.arange(
+                    past_length + key_states.size(-2) - (self.window_size - self.sink_size),
+                    past_length + key_states.size(-2),
+                    device=position_ids.device
+                )
+                key_position_ids = torch.cat([sink_positions, recent_positions])
+        else:
+            key_position_ids = position_ids.view(-1)
+
+        key_position_ids = key_position_ids.unsqueeze(0)
         
+        # Apply rotary embeddings with corrected positions
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
+
         if past_key_value is not None and isinstance(past_key_value, DynamicCache):
             if self.layer_idx < len(past_key_value.key_cache):
                 past_key = past_key_value.key_cache[self.layer_idx]
@@ -92,10 +138,6 @@ class StreamingAttention(LlamaAttention):
                     key_states = torch.cat([past_key, key_states], dim=2)
                     value_states = torch.cat([past_value, value_states], dim=2)
 
-        # Apply position-shifted rotary embeddings to key states
-        key_position_ids = torch.arange(key_states.size(-2), device=position_ids.device).unsqueeze(0)
-        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
-
         # Update cache if needed
         if use_cache:
             if isinstance(past_key_value, DynamicCache):
@@ -117,23 +159,29 @@ class StreamingAttention(LlamaAttention):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            # Handle attention mask for streaming
+            # Ensure proper mask shape and values for streaming
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            
+            # Handle streaming window attention mask
             if attention_mask.size(-1) != key_states.size(-2):
-                # If input attention mask is larger than window size, truncate it
-                if attention_mask.size(-1) > self.window_size:
-                    attention_mask = attention_mask[:, :, :, -self.window_size:]
-                
-                # Create new attention mask matching the key_states size
-                new_attention_mask = torch.zeros(
-                    bsz, 1, q_len, key_states.size(-2),
-                    device=attention_mask.device,
-                    dtype=attention_mask.dtype
+                window_mask = torch.ones(
+                    (bsz, 1, q_len, key_states.size(-2)),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
                 )
                 
-                # Place the attention mask in the correct position
-                offset = key_states.size(-2) - attention_mask.size(-1)
-                new_attention_mask[:, :, :, offset:] = attention_mask
-                attention_mask = new_attention_mask
+                # Always allow attention to sink tokens
+                window_mask[:, :, :, :self.sink_size] = 0
+                
+                # Add causal mask for recent tokens
+                recent_size = min(self.window_size - self.sink_size, key_states.size(-2) - self.sink_size)
+                window_mask[:, :, :, -recent_size:] = torch.triu(
+                    torch.ones((q_len, recent_size), device=attention_mask.device),
+                    diagonal=1
+                ).unsqueeze(0).unsqueeze(1)
+                
+                attention_mask = window_mask * -10000.0
             
             attn_weights = attn_weights + attention_mask
 
@@ -145,31 +193,62 @@ class StreamingAttention(LlamaAttention):
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
+        # Add safety checks for cache
+        if past_key_value is not None and isinstance(past_key_value, DynamicCache):
+            # Validate cache indices
+            if self.layer_idx >= len(past_key_value.key_cache):
+                past_key_value.key_cache.extend([None] * (self.layer_idx + 1 - len(past_key_value.key_cache)))
+                past_key_value.value_cache.extend([None] * (self.layer_idx + 1 - len(past_key_value.value_cache)))
+            
+            # Ensure cache tensors are on correct device
+            if past_key_value.key_cache[self.layer_idx] is not None:
+                past_key_value.key_cache[self.layer_idx] = past_key_value.key_cache[self.layer_idx].to(hidden_states.device)
+                past_key_value.value_cache[self.layer_idx] = past_key_value.value_cache[self.layer_idx].to(hidden_states.device)
+
+        # Free memory explicitly
+        if past_key_value is not None and isinstance(past_key_value, DynamicCache):
+            past_key_value.key_cache[self.layer_idx] = past_key_value.key_cache[self.layer_idx].detach()
+            past_key_value.value_cache[self.layer_idx] = past_key_value.value_cache[self.layer_idx].detach()
+
         return attn_output, attn_weights if output_attentions else None, past_key_value
 
 def convert_to_streaming_attention(model, config):
     """Convert a model to use streaming attention."""
-    device = next(model.parameters()).device  # Get model's device
+    device = next(model.parameters()).device
     
-    # Initialize cache for all layers using DynamicCache
-    if not hasattr(model, 'past_key_values'):
-        model.past_key_values = DynamicCache()
+    # Ensure config has required attributes
+    if not hasattr(config, 'window_size'):
+        config.window_size = 256
+    if not hasattr(config, 'sink_size'):
+        config.sink_size = min(32, config.window_size // 8)
     
-    # Convert attention layers
+    # Validate config
+    if config.sink_size >= config.window_size:
+        raise ValueError(f"sink_size ({config.sink_size}) must be less than window_size ({config.window_size})")
+    
+    # Initialize cache with proper device placement
+    model.past_key_values = DynamicCache()
+    
+    # Convert attention layers with proper weight transfer
     for i, layer in enumerate(model.model.layers):
         streaming_attn = StreamingAttention(config, layer_idx=i)
         
-        # Copy weights from original attention
-        streaming_attn.q_proj.weight.data = layer.self_attn.q_proj.weight.data.clone()
-        streaming_attn.k_proj.weight.data = layer.self_attn.k_proj.weight.data.clone()
-        streaming_attn.v_proj.weight.data = layer.self_attn.v_proj.weight.data.clone()
-        streaming_attn.o_proj.weight.data = layer.self_attn.o_proj.weight.data.clone()
+        # Ensure proper weight transfer
+        with torch.no_grad():
+            for name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                getattr(streaming_attn, name).weight.copy_(
+                    getattr(layer.self_attn, name).weight
+                )
+                if hasattr(getattr(layer.self_attn, name), 'bias'):
+                    getattr(streaming_attn, name).bias.copy_(
+                        getattr(layer.self_attn, name).bias
+                    )
         
-        # Ensure rotary embeddings are on correct device
+        # Transfer rotary embeddings
         streaming_attn.rotary_emb = layer.self_attn.rotary_emb
+        
+        # Ensure proper device placement
         streaming_attn = streaming_attn.to(device)
-        
-        # Replace the attention layer
         layer.self_attn = streaming_attn
-        
+    
     return model

@@ -45,23 +45,33 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
     device = torch.device(config.device)
     
     try:
-        # Clear memory before starting
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Safer memory clearing
+        try:
+            if torch.cuda.is_available():
+                # Reset peak memory stats
+                torch.cuda.reset_peak_memory_stats()
+                # Safer empty cache
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+            gc.collect()
+        except RuntimeError as e:
+            log(f"Warning: Memory cleanup error (non-critical): {e}")
         
-        # Set memory allocation strategy
+        # Set memory allocation strategy more conservatively
         if device.type == "cuda":
-            torch.cuda.set_per_process_memory_fraction(0.9)
-            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Reduced from 0.9
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
         
         # Load model and tokenizer
         log("\nInitializing components...")
         model_loader = ModelLoader(config)
+        
+        # Use mixed precision more explicitly
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
         with torch.cuda.amp.autocast():
             model, tokenizer = model_loader.load_model_and_tokenizer()
-            model = model.to(device)
+            model = model.to(device).to(dtype)
             
-            # Initialize dataset manager with tokenizer
             dataset_manager = DatasetManager(config, tokenizer)
             
             if config.attention_type != "default":
@@ -89,30 +99,45 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
                         continue
                     
                     for batch in tqdm(dataset, desc="Processing examples"):
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-                        
-                        with torch.cuda.amp.autocast():
-                            with torch.no_grad():
-                                input_ids = batch['input_ids'].to(device)
-                                attention_mask = batch['attention_mask'].to(device)
-                                input_text = batch['text']
-                                
-                                start_time = time.time()
-                                outputs = model.generate(
-                                    input_ids,
-                                    attention_mask=attention_mask,
-                                    max_new_tokens=min(config.max_tokens, 128),
-                                    do_sample=True,
-                                    temperature=config.temperature,
-                                    return_dict_in_generate=True,
-                                    output_scores=True,
-                                    pad_token_id=tokenizer.pad_token_id
-                                )
-                                
-                                result = process_outputs(outputs, input_text, tokenizer, start_time, config, device)
-                                results.append(result)
-                                del outputs
+                        try:
+                            if device.type == "cuda":
+                                with torch.cuda.device(device):
+                                    torch.cuda.empty_cache()
+                            
+                            with torch.cuda.amp.autocast():
+                                with torch.no_grad():
+                                    input_ids = batch['input_ids'].to(device)
+                                    attention_mask = batch['attention_mask'].to(device)
+                                    input_text = batch['text']
+                                    
+                                    start_time = time.time()
+                                    outputs = model.generate(
+                                        input_ids,
+                                        attention_mask=attention_mask,
+                                        max_new_tokens=min(config.max_tokens, 128),
+                                        do_sample=True,
+                                        temperature=config.temperature,
+                                        return_dict_in_generate=True,
+                                        output_scores=True,
+                                        pad_token_id=tokenizer.pad_token_id
+                                    )
+                                    
+                                    result = process_outputs(outputs, input_text, tokenizer, start_time, config, device)
+                                    results.append(result)
+                                    
+                            # Explicit cleanup after each batch
+                            del outputs
+                            del input_ids
+                            del attention_mask
+                            
+                        except RuntimeError as e:
+                            if "out of memory" in str(e):
+                                log(f"OOM error, attempting recovery: {str(e)}")
+                                if torch.cuda.is_available():
+                                    with torch.cuda.device(device):
+                                        torch.cuda.empty_cache()
+                                continue
+                            raise e
                                 
                 except Exception as e:
                     log(f"Error testing {dataset_config.name}: {str(e)}")
@@ -121,11 +146,17 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
                     continue
                 
     finally:
-        # Clean up
-        if 'model' in locals():
-            del model
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Safer cleanup
+        try:
+            if 'model' in locals():
+                model.cpu()
+                del model
+            if torch.cuda.is_available():
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            log(f"Warning: Final cleanup error (non-critical): {e}")
     
     if save_results and results:
         save_results_to_file(results, config)
