@@ -44,7 +44,10 @@ class LiquidFusion(nn.Module):
         self.recent_ratio = getattr(config, 'recent_ratio', 0.3)
         
         # Initialize sink cache
-        self.sink_cache = {'k': None, 'v': None}
+        self.sink_cache = {
+            'k': None,  # Will be initialized on first forward pass
+            'v': None
+        }
         self.sink_update_rate = getattr(config, 'sink_update_rate', 0.1)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -67,35 +70,55 @@ class LiquidFusion(nn.Module):
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+        # Apply rotary embeddings
+        if position_ids is not None:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        # Handle past key values
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None and isinstance(past_key_value, DynamicCache):
             kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
-
-        # Apply rotary embeddings
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        # Update sink cache
-        if self.sink_cache['k'] is None:
-            self.sink_cache = {
-                'k': key_states[:, :, :self.sink_size, :].detach().clone(),
-                'v': value_states[:, :, :self.sink_size, :].detach().clone()
-            }
-        else:
-            self.sink_cache = {
-                'k': (1 - self.sink_update_rate) * self.sink_cache['k'] + self.sink_update_rate * key_states[:, :, :self.sink_size, :].detach(),
-                'v': (1 - self.sink_update_rate) * self.sink_cache['v'] + self.sink_update_rate * value_states[:, :, :self.sink_size, :].detach()
-            }
-
-        # Handle past key/value states for streaming
-        if past_key_value is not None and isinstance(past_key_value, DynamicCache):
             if self.layer_idx < len(past_key_value.key_cache):
                 past_key = past_key_value.key_cache[self.layer_idx]
                 past_value = past_key_value.value_cache[self.layer_idx]
                 
-                if past_key.size(2) > 0:
+                if past_key is not None and past_key.size(2) > 0:
                     key_states = torch.cat([past_key, key_states], dim=2)
                     value_states = torch.cat([past_value, value_states], dim=2)
+
+        # Update sink cache
+        if self.sink_cache['k'] is not None and self.sink_cache['k'].size(0) != bsz:
+            # Reset sink cache for new batch size
+            self.sink_cache = {
+                'k': None,
+                'v': None
+            }
+
+        if self.sink_cache['k'] is None:
+            self.sink_cache = {
+                'k': key_states.new_zeros(bsz, self.num_heads, self.sink_size, self.head_dim),
+                'v': value_states.new_zeros(bsz, self.num_heads, self.sink_size, self.head_dim)
+            }
+            if key_states.size(2) >= self.sink_size:
+                self.sink_cache['k'].copy_(key_states[:, :, :self.sink_size, :].detach())
+                self.sink_cache['v'].copy_(value_states[:, :, :self.sink_size, :].detach())
+        else:
+            # Ensure batch size matches
+            if self.sink_cache['k'].size(0) != bsz:
+                self.sink_cache = {
+                    'k': self.sink_cache['k'].expand(bsz, -1, -1, -1),
+                    'v': self.sink_cache['v'].expand(bsz, -1, -1, -1)
+                }
+            
+            # Update with exponential moving average
+            if key_states.size(2) >= self.sink_size:
+                self.sink_cache = {
+                    'k': (1 - self.sink_update_rate) * self.sink_cache['k'] + 
+                         self.sink_update_rate * key_states[:, :, :self.sink_size, :].detach(),
+                    'v': (1 - self.sink_update_rate) * self.sink_cache['v'] + 
+                         self.sink_update_rate * value_states[:, :, :self.sink_size, :].detach()
+                }
 
         # Compute attention scores
         scale = 1 / math.sqrt(self.head_dim)
@@ -105,8 +128,8 @@ class LiquidFusion(nn.Module):
         regular_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * scale
 
         # Calculate heavy-hitter budget
-        heavy_budget = int(self.heavy_ratio * key_states.size(-2))
-        recent_budget = int(self.recent_ratio * key_states.size(-2))
+        heavy_budget = max(1, int(self.heavy_ratio * key_states.size(-2)))
+        recent_budget = max(1, int(self.recent_ratio * key_states.size(-2)))
 
         # Identify heavy hitters (global statistics approach)
         tmp_attn = F.softmax(regular_scores, dim=-1, dtype=torch.float32).to(regular_scores.dtype)
@@ -122,14 +145,37 @@ class LiquidFusion(nn.Module):
         recent_mask = torch.tril(torch.ones_like(regular_scores, dtype=torch.bool), diagonal=recent_budget)
         mask = torch.logical_or(heavy_mask, recent_mask)
 
-        # Apply masks and combine scores
+        # Apply masks
         regular_scores = torch.where(mask, regular_scores, torch.finfo(regular_scores.dtype).min)
+        
+        # Ensure dimensions match before concatenation
+        if sink_scores.size(-1) != self.sink_size:
+            sink_scores = sink_scores[..., :self.sink_size]
+        if regular_scores.size(-1) != key_states.size(-2):
+            regular_scores = regular_scores[..., :key_states.size(-2)]
+        
         scores = torch.cat([sink_scores, regular_scores], dim=-1)
 
         # Apply attention mask if provided
         if attention_mask is not None:
-            sink_mask = torch.zeros_like(sink_scores)
-            attention_mask = torch.cat([sink_mask, attention_mask], dim=-1)
+            # Ensure attention_mask has correct shape
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            
+            # Create sink attention mask
+            sink_attention_mask = attention_mask.new_zeros(
+                *attention_mask.shape[:-1], 
+                self.sink_size
+            )
+            
+            # Ensure regular attention mask matches key_states size
+            if attention_mask.size(-1) != key_states.size(-2):
+                attention_mask = attention_mask[..., :key_states.size(-2)]
+            
+            # Combine sink and regular attention masks
+            attention_mask = torch.cat([sink_attention_mask, attention_mask], dim=-1)
+            
+            # Apply attention mask
             scores = scores + attention_mask
 
         # Calculate attention weights and output
