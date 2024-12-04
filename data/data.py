@@ -28,30 +28,29 @@ class ModelDataset(Dataset):
             if 'goal' in item:  # PIQA format
                 choices = f"1. {item['sol1']}\n2. {item['sol2']}"
                 text = f"Goal: {item['goal']}\nChoices:\n{choices}"
+                target = item.get('label', '')  # PIQA target
             elif 'ctx' in item:  # Hellaswag format
                 choices = "\n".join([f"{i+1}. {ending}" for i, ending in enumerate(item['endings'])])
                 text = f"Context: {item['ctx']}\nChoices:\n{choices}"
+                target = item.get('label', '')  # Hellaswag target
             elif 'question' in item and 'choices' in item:  # MMLU format
                 choices = "\n".join([f"{i+1}. {choice}" for i, choice in enumerate(item['choices'])])
                 text = f"Question: {item['question']}\nChoices:\n{choices}"
-            elif 'question' in item and 'passage' in item:  # BoolQ format
-                text = f"Question: {item['question']}\nPassage: {item['passage']}"
-            elif 'premise' in item and 'hypothesis' in item:  # CB format
-                text = f"Premise: {item['premise']}\nHypothesis: {item['hypothesis']}"
-            elif 'sentence1' in item and 'sentence2' in item:  # WiC/WSC format
-                text = f"{item['sentence1']} {item['sentence2']}"
-            elif 'sentence' in item:  # Winogrande format
-                text = f"{item['sentence']} Option 1: {item['option1']} Option 2: {item['option2']}"
-            elif 'context' in item and 'question' in item:  # PubMedQA format
-                text = f"Question: {item['question']}\nContext: {item['context']}"
-            elif 'Problem' in item:  # MathQA format
-                text = f"Problem: {item['Problem']}\nRationale: {item['Rationale']}"
+                target = item.get('answer', '')  # MMLU target
+            elif 'document' in item:  # XSUM format
+                text = f"Article: {item['document']}\nSummarize the above article:"
+                target = item.get('summary', '')  # XSUM target
+            elif 'article' in item:  # CNN/DailyMail format
+                text = f"Article: {item['article']}\nSummarize the above article:"
+                target = item.get('highlights', '')  # CNN/DailyMail target
             elif 'text' in item:
                 text = item['text']
+                target = ''
             else:
                 raise ValueError(f"Unknown dataset format with keys: {item.keys()}")
         else:
             text = str(item)
+            target = ''
 
         # Tokenize
         encodings = self.tokenizer(
@@ -62,26 +61,26 @@ class ModelDataset(Dataset):
             return_tensors='pt'
         )
         
-        # Add labels for language modeling
         input_ids = encodings['input_ids'].squeeze()
-        labels = input_ids.clone()
+        attention_mask = encodings['attention_mask'].squeeze()
         
         return {
-            'text': text,  # Add the formatted text
+            'text': text,
             'input_ids': input_ids,
-            'attention_mask': encodings['attention_mask'].squeeze(),
-            'labels': labels
+            'attention_mask': attention_mask,
+            'labels': input_ids.clone(),
+            'target': target
         }
 
 def collate_fn(batch):
-    # Combine all items in the batch
-    batch_dict = {
-        'text': [item['text'] for item in batch],  # Include text in batch
+    """Combine items into batches."""
+    return {
+        'text': [item['text'] for item in batch],
         'input_ids': torch.stack([item['input_ids'] for item in batch]),
         'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
-        'labels': torch.stack([item['labels'] for item in batch])
+        'labels': torch.stack([item['labels'] for item in batch]),
+        'target': [item['target'] for item in batch]
     }
-    return batch_dict
 
 class DatasetManager:
     def __init__(self, config, tokenizer):

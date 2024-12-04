@@ -10,8 +10,27 @@ from data.config import BenchmarkConfig
 from models.base_models import ModelLoader
 from data.data import DatasetManager
 from data.metrics import BenchmarkMetrics
+from data.config import BenchmarkConfig
+from models.attention.sparse_attention import convert_attention_type
+from models.h2o.h2o_llama import convert_kvcache_llama_heavy_recent
 
 import gc
+
+def save_results_to_file(results: list, config: BenchmarkConfig):
+    """Save benchmark results to a JSON file."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = config.model_name.split('/')[-1]  # Get just the model name without path
+    filename = f"benchmark_results_{model_name}_{timestamp}.json"
+    
+    try:
+        with open(filename, "w") as f:
+            for result in results:
+                f.write(json.dumps(result) + '\n')
+        print(f"\nResults saved to {filename}")
+    except Exception as e:
+        print(f"Error saving results: {str(e)}")
+
+# Local imports
 
 def run_benchmark(config: BenchmarkConfig, 
                  save_results: bool = True,
@@ -33,6 +52,24 @@ def run_benchmark(config: BenchmarkConfig,
         # Load model with memory optimizations
         model_loader = ModelLoader(config)
         model, tokenizer = model_loader.load_model_and_tokenizer()
+        
+        # Convert attention mechanism based on config
+        if config.attention_type != "default":
+            log(f"\nConverting attention mechanism to {config.attention_type}...")
+            
+            if config.attention_type == "h2o":
+                # Set H2O specific config parameters
+                model.config.heavy_ratio = config.heavy_ratio
+                model.config.recent_ratio = config.recent_ratio
+                model = convert_kvcache_llama_heavy_recent(model, model.config)
+            else:
+                # Set sparse attention specific config parameters
+                model.config.window_size = config.window_size
+                if config.attention_type == "sparse_strided":
+                    model.config.stride = config.stride
+                model = convert_attention_type(model, config.attention_type, model.config)
+            
+            log("Attention mechanism converted successfully")
         
         # Enable memory efficient options
         if hasattr(model, "enable_input_require_grads"):
