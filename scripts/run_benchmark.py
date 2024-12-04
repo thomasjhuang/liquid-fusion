@@ -13,6 +13,7 @@ from data.metrics import BenchmarkMetrics
 from data.config import BenchmarkConfig
 from models.attention.sparse_attention import convert_attention_type
 from models.h2o.h2o_llama import convert_kvcache_llama_heavy_recent
+from models.attention.streaming import convert_to_streaming_attention
 
 import gc
 
@@ -62,6 +63,12 @@ def run_benchmark(config: BenchmarkConfig,
                 model.config.heavy_ratio = config.heavy_ratio
                 model.config.recent_ratio = config.recent_ratio
                 model = convert_kvcache_llama_heavy_recent(model, model.config)
+            elif config.attention_type == "streaming":
+                # Set streaming specific config parameters
+                model.config.window_size = config.window_size
+                model.config.sink_size = config.sink_size
+                model.config.sink_update_rate = config.sink_update_rate
+                model = convert_to_streaming_attention(model, model.config)
             else:
                 # Set sparse attention specific config parameters
                 model.config.window_size = config.window_size

@@ -37,23 +37,26 @@ def get_default_dataset_configs() -> Dict[str, DatasetConfig]:
 class BenchmarkConfig:
     model_name: str
     model_type: str
-    attention_type: str = "default"  # Options: "default", "h2o", "sparse_fixed", "sparse_strided"
+    attention_type: str = "default"  # Options: "default", "h2o", "sparse_fixed", "sparse_strided", "streaming"
     
-    # H2O specific parameters
-    heavy_ratio: float = 0.1  # Ratio of tokens to keep as heavy hitters
-    recent_ratio: float = 0.1  # Ratio of recent tokens to keep
-    
-    # Sparse attention specific parameters
-    window_size: int = 256  # Window size for local attention
-    stride: int = 128  # Stride size for strided attention
-
-    datasets: List[DatasetConfig] = field(default_factory=list)
-    sequence_length: int = 1024
-    dtype: str = "bfloat16"
-    device: str = "cuda"
+    # General parameters
+    max_tokens: int = 128
     temperature: float = 0.7
-    max_tokens: int = 50 
-    use_amp: bool = False
+    
+    # Dataset configuration
+    datasets: List[DatasetConfig] = None
+    
+    # Sparse attention parameters
+    window_size: Optional[int] = None
+    stride: Optional[int] = None
+    
+    # H2O attention parameters
+    heavy_ratio: Optional[float] = None
+    recent_ratio: Optional[float] = None
+    
+    # Streaming attention parameters
+    sink_size: Optional[int] = None
+    sink_update_rate: Optional[float] = None
 
     def switch_dataset(self, dataset_name: str):
         """Switch datasets based on a string identifier."""
