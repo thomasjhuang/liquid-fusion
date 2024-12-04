@@ -24,16 +24,22 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
         position_ids = position_ids.unsqueeze(0)
     
     # Get rotary embeddings for the requested positions
-    cos = cos[position_ids]  # [bs, seq_len, dim]
-    sin = sin[position_ids]  # [bs, seq_len, dim]
+    cos = cos[position_ids % cos.size(0)]  # Add modulo to handle positions beyond seq_len
+    sin = sin[position_ids % sin.size(0)]  # Add modulo to handle positions beyond seq_len
     
     # Add head dimension
     cos = cos.unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin.unsqueeze(1)  # [bs, 1, seq_len, dim]
     
     # Make sure dimensions match
-    cos = cos[:, :, :x.size(-2), :]  # Truncate or pad sequence length
-    sin = sin[:, :, :x.size(-2), :]  # Truncate or pad sequence length
+    if cos.size(2) > x.size(-2):
+        cos = cos[:, :, :x.size(-2), :]
+        sin = sin[:, :, :x.size(-2), :]
+    elif cos.size(2) < x.size(-2):
+        # Pad cos and sin to match x's sequence length
+        pad_len = x.size(-2) - cos.size(2)
+        cos = F.pad(cos, (0, 0, 0, pad_len, 0, 0, 0, 0))
+        sin = F.pad(sin, (0, 0, 0, pad_len, 0, 0, 0, 0))
     
     return (x * cos) + (rotate_half(x) * sin)
 
@@ -235,14 +241,18 @@ def convert_to_streaming_attention(model, config):
         
         # Ensure proper weight transfer
         with torch.no_grad():
+            # Transfer weights safely
             for name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-                getattr(streaming_attn, name).weight.copy_(
-                    getattr(layer.self_attn, name).weight
+                # Copy weights
+                getattr(streaming_attn, name).weight.data.copy_(
+                    getattr(layer.self_attn, name).weight.data
                 )
-                if hasattr(getattr(layer.self_attn, name), 'bias'):
-                    getattr(streaming_attn, name).bias.copy_(
-                        getattr(layer.self_attn, name).bias
-                    )
+                
+                # Only copy bias if it exists in both models
+                source_bias = getattr(getattr(layer.self_attn, name), 'bias', None)
+                target_bias = getattr(getattr(streaming_attn, name), 'bias', None)
+                if source_bias is not None and target_bias is not None:
+                    target_bias.data.copy_(source_bias.data)
         
         # Transfer rotary embeddings
         streaming_attn.rotary_emb = layer.self_attn.rotary_emb
