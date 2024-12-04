@@ -16,6 +16,7 @@ from data.config import BenchmarkConfig
 from models.attention.sparse_attention import convert_attention_type
 from models.h2o.h2o_llama import convert_kvcache_llama_heavy_recent
 from models.attention.streaming import convert_to_streaming_attention
+from models.attention.liquid_fusion import convert_to_liquid_fusion
 
 import gc
 import os
@@ -209,134 +210,97 @@ def process_outputs(outputs, input_text, tokenizer, start_time, config, device):
         }
     }
 
-
-def run_attention_strategy_comparison(config, cache_sizes=[100, 80, 60, 20, 10, 4]):
-    """
-    Run benchmarks comparing different attention strategies:
-    - Full Attention (baseline)
-    - Local Attention (simple windowing)
-    - Heavy Hitter Oracle (H2O)
-    - Liquid Fusion (combines sink tokens with heavy hitters)
-    - Streaming LLM (attention sink mechanism)
-    """
-    comparison_results = {
-        'full': {},
-        'local': {},
-        'h2o': {},
-        'liquid_fusion': {},
-        'streaming': {}
+def save_benchmark_results(results: list, config: BenchmarkConfig, strategy: str, cache_size: int):
+    """Save benchmark results with detailed configuration info."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = config.model_name.split('/')[-1]
+    
+    # Create results directory if it doesn't exist
+    os.makedirs("benchmark_results", exist_ok=True)
+    
+    # Create detailed filename
+    filename = f"benchmark_results/{strategy}_{model_name}_cache{cache_size}_{timestamp}.json"
+    
+    # Prepare metadata
+    metadata = {
+        "model_name": config.model_name,
+        "strategy": strategy,
+        "cache_size": cache_size,
+        "attention_type": config.attention_type,
+        "window_size": getattr(config, 'window_size', None),
+        "sink_size": getattr(config, 'sink_size', None),
+        "sink_update_rate": getattr(config, 'sink_update_rate', None),
+        "heavy_ratio": getattr(config, 'heavy_ratio', None),
+        "recent_ratio": getattr(config, 'recent_ratio', None),
+        "max_tokens": config.max_tokens,
+        "temperature": config.temperature,
+        "timestamp": timestamp,
+        "device": config.device
     }
     
-    base_config = copy.deepcopy(config)
-    
-    # Load model once and reuse
-    model_loader = ModelLoader(base_config)
-    base_model, tokenizer = model_loader.load_model_and_tokenizer()
+    # Combine metadata with results
+    full_results = {
+        "metadata": metadata,
+        "results": results
+    }
     
     try:
-        for strategy in comparison_results.keys():
-            print(f"\nTesting {strategy} strategy...")
-            deep_memory_cleanup()  # Clean between strategies
+        with open(filename, "w") as f:
+            json.dump(full_results, f, indent=2)
+        print(f"\nResults saved to {filename}")
+    except Exception as e:
+        print(f"Error saving results: {str(e)}")
+
+def run_single_strategy_benchmark(config: BenchmarkConfig, strategy: str, cache_size: int):
+    """Run benchmark for a single strategy and cache size."""
+    print(f"\nTesting {strategy} strategy with {cache_size}% cache")
+    
+    # Adjust config based on strategy
+    current_config = copy.deepcopy(config)
+    if strategy == "default" or strategy == "full":
+        current_config.attention_type = "default"
+        current_config.kv_cache_budget = 100  # Full cache for default attention
+    else:
+        current_config.attention_type = strategy
+        current_config.kv_cache_budget = cache_size
+    
+    try:
+        deep_memory_cleanup()
+        
+        # Load model
+        model_loader = ModelLoader(current_config)
+        model, tokenizer = model_loader.load_model_and_tokenizer()
+        
+        # Configure model based on strategy
+        if strategy not in ["default", "full"]:
+            print(f"Converting to {strategy} attention...")
+            model.config.kv_cache_budget = cache_size
             
-            for cache_size in cache_sizes:
-                if strategy == 'full' and cache_size != 100:
-                    continue
-                    
-                print(f"Testing with {cache_size}% cache budget")
-                model = copy.deepcopy(base_model)
-                
-                try:
-                    results = run_benchmark(current_config, save_results=False, verbose=False)
-                    
-                    # Calculate metrics
-                    rouge_scores = calculate_rouge_scores(results, current_config.reference_texts)
-                    throughput = calculate_throughput(results)
-                    memory_usage = measure_memory_usage()
-                    
-                    comparison_results[strategy][cache_size] = {
-                        **rouge_scores,
-                        'throughput': throughput,
-                        'memory': memory_usage
-                    }
-                    
-                except Exception as e:
-                    print(f"Error testing {strategy} with {cache_size}% cache: {str(e)}")
-                    continue
-                    
-                finally:
-                    deep_memory_cleanup(model)  # Ensure cleanup happens
+            # Copy config parameters
+            for param in ['window_size', 'sink_size', 'sink_update_rate', 
+                         'heavy_ratio', 'recent_ratio']:
+                if hasattr(current_config, param):
+                    setattr(model.config, param, getattr(current_config, param))
+            
+            # Convert attention
+            if strategy == 'h2o':
+                model = convert_kvcache_llama_heavy_recent(model, model.config)
+            elif strategy == 'liquid_fusion':
+                model = convert_to_liquid_fusion(model, model.config)
+            elif strategy == 'streaming':
+                model = convert_to_streaming_attention(model, model.config)
+            elif strategy == 'local':
+                model = convert_kvcache_llama_heavy_recent(model, model.config)
+        
+        # Run benchmark
+        results = run_benchmark(current_config, save_results=False, verbose=False)
+        save_benchmark_results(results, current_config, strategy, cache_size)
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        
     finally:
-        deep_memory_cleanup(base_model)  # Final cleanup
-    
-    return comparison_results
-
-def plot_comparison_metrics(results, metric='rouge1', title=None):
-    """Create visualizations comparing different strategies across multiple metrics."""
-    plt.figure(figsize=(12, 7))
-    
-    # Define consistent colors and markers for each strategy
-    style_dict = {
-        'full': ('blue', 'o', 'Full'),
-        'local': ('red', 's', 'Local'),
-        'h2o': ('green', '^', 'H2O'),
-        'liquid_fusion': ('purple', 'D', 'Liquid Fusion'),
-        'streaming': ('orange', 'v', 'StreamingLLM')
-    }
-    
-    for strategy, measurements in results.items():
-        cache_sizes = sorted(measurements.keys())
-        scores = [measurements[size][metric] for size in cache_sizes]
-        
-        color, marker, label = style_dict[strategy]
-        plt.plot(cache_sizes, scores, 
-                marker=marker,
-                color=color,
-                label=label,
-                linewidth=2,
-                markersize=8,
-                markeredgecolor='black',
-                markeredgewidth=1)
-    
-    plt.xlabel('KV Cache Budget (%)')
-    plt.ylabel(f'{metric.upper()} Score')
-    plt.title(title or f'{metric.upper()} vs KV Cache Budget')
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    
-    return plt
-
-# Helper functions for additional metrics
-def calculate_throughput(results):
-    """Calculate average tokens/second"""
-    total_time = sum(r['result']['request_time']['batch_time'] for r in results)
-    total_tokens = sum(len(r['result']['choices'][0]['logprobs']['tokens']) for r in results)
-    return total_tokens / total_time
-
-def measure_memory_usage():
-    """Measure GPU memory usage"""
-    if torch.cuda.is_available():
-        return torch.cuda.max_memory_allocated() / 1024**3  # Convert to GB
-    return 0
-
-def calculate_rouge_scores(results, reference_texts=None):
-    """Calculate ROUGE scores for generated texts"""
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-    scores = {'rouge1': 0, 'rouge2': 0, 'rougeL': 0}
-    
-    for result in results:
-        generated = result['result']['choices'][0]['text']
-        reference = result['request']['prompt'].split('Summary: ')[-1]
-        
-        # Calculate scores
-        score = scorer.score(reference, generated)
-        scores['rouge1'] += score['rouge1'].fmeasure
-        scores['rouge2'] += score['rouge2'].fmeasure
-        scores['rougeL'] += score['rougeL'].fmeasure
-    
-    # Average scores
-    n = len(results)
-    return {k: v/n for k, v in scores.items()}
+        deep_memory_cleanup(model if 'model' in locals() else None)
 
 def detailed_memory_check(label=""):
     """Detailed memory analysis with tensor tracking"""
@@ -438,89 +402,35 @@ def aggressive_memory_cleanup(model=None):
     
     print("\nMemory cleanup completed")
 
-def deep_memory_cleanup(model=None, verbose=True):
+def deep_memory_cleanup(model=None, verbose=False):
     """Comprehensive memory cleanup including model weights, CUDA cache, and system memory."""
     if verbose:
-        print("\n=== Starting Deep Memory Cleanup ===")
-        
-        # Initial memory check
-        if torch.cuda.is_available():
-            print("\nInitial CUDA Memory:")
-            device = torch.cuda.current_device()
-            print(f"Allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
-            print(f"Cached: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
-            print(f"Max Allocated: {torch.cuda.max_memory_allocated(device) / 1024**3:.2f} GB")
+        print("Cleaning up memory...")
     
     # 1. Clear model and its weights if provided
     if model is not None:
         try:
-            # Move model to CPU and clear its memory
             model.cpu()
             for param in model.parameters():
                 if hasattr(param, 'data'):
                     param.data = None
                 if hasattr(param, 'grad'):
                     param.grad = None
-            
-            # Clear buffers and caches
-            for buffer in model.buffers():
-                if hasattr(buffer, 'data'):
-                    buffer.data = None
-            
-            if hasattr(model, 'past_key_values'):
-                model.past_key_values = None
-            
-            # Clear state dict and delete model
             model.state_dict().clear()
             del model
-        except Exception as e:
-            if verbose:
-                print(f"Warning during model clearing: {e}")
+        except Exception:
+            pass
     
-    # 2. Clear all remaining tensors and CUDA storage
-    for obj in gc.get_objects():
-        try:
-            if torch.is_tensor(obj):
-                if obj.is_cuda:
-                    obj.cpu()
-                obj.data = None
-                del obj
-            elif hasattr(obj, 'storage') and hasattr(obj.storage, '_cuda_storage'):
-                obj.storage._cuda_storage = None
-        except:
-            continue
-    
-    # 3. Clear CUDA memory if available
+    # 2. Clear CUDA memory
     if torch.cuda.is_available():
         try:
-            # Multiple passes of cache clearing for each device
             for i in range(torch.cuda.device_count()):
                 with torch.cuda.device(i):
-                    for _ in range(3):
-                        torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
                     torch.cuda.reset_peak_memory_stats()
-            
-            # Reset memory allocator
-            if hasattr(torch.cuda.memory, '_reset_memory_allocator'):
-                torch.cuda.memory._reset_memory_allocator()
-        except Exception as e:
-            if verbose:
-                print(f"Error during CUDA cleanup: {e}")
+        except Exception:
+            pass
     
-    # 4. Multiple GC runs
+    # 3. Multiple GC runs
     for _ in range(5):
         gc.collect()
-    
-    # 5. Final memory check if verbose
-    if verbose:
-        print("\nFinal Memory Status:")
-        if torch.cuda.is_available():
-            print(f"Allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
-            print(f"Cached: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
-        
-        # System memory
-        process = psutil.Process()
-        print(f"System RSS: {process.memory_info().rss / 1024**3:.2f} GB")
-        print("\n=== Memory Cleanup Completed ===")
-    
-    return None
