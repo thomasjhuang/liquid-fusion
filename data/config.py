@@ -48,6 +48,7 @@ class BenchmarkConfig:
         device: str = "cuda",
         sequence_length: int = 512,
         max_position_embeddings: int = 2048,
+        compute_metrics: bool = False,
         
         # Dataset configuration
         datasets: List[DatasetConfig] = None,
@@ -73,6 +74,7 @@ class BenchmarkConfig:
         self.device = device
         self.sequence_length = sequence_length
         self.max_position_embeddings = max_position_embeddings
+        self.compute_metrics = compute_metrics
         self.datasets = datasets
         self.window_size = window_size
         self.stride = stride
