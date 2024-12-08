@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import torch
 from tqdm import tqdm
 from rouge_score import rouge_scorer
+import math
+import numpy as np
 
 # Local imports
 from data.config import BenchmarkConfig
@@ -106,7 +108,7 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
                                             pad_token_id=tokenizer.pad_token_id
                                         )
                                         
-                                        result = process_outputs(outputs, input_text, tokenizer, start_time, config, device)
+                                        result = process_outputs(outputs, input_text, batch['reference_text'], tokenizer, start_time, config, device)
                                         results.append(result)
                                 
                                 # Cleanup after each batch
@@ -135,47 +137,83 @@ def run_benchmark(config: BenchmarkConfig, save_results: bool = True, verbose: b
     
     return results
 
-def process_outputs(outputs, input_text, tokenizer, start_time, config, device):
-    """Process model outputs into result format"""
+def process_outputs(outputs, input_text, reference_text, tokenizer, start_time, config, device):
+    """Process model outputs into result format with comprehensive metrics for strategy comparison"""
     generated_tokens = outputs.sequences[0, -config.max_tokens:].detach()
-    tokens = tokenizer.convert_ids_to_tokens(generated_tokens.cpu())
+    generated_text = tokenizer.decode(generated_tokens.cpu(), skip_special_tokens=True)
+    generation_time = time.time() - start_time
     
-    # Calculate log probabilities
+    # Calculate perplexity
     logprobs = []
-    top_logprobs = []
     for logits in outputs.scores:
-        logits = logits[0].detach()  # Detach from computation graph
+        logits = logits[0].detach()
         probs = F.softmax(logits, dim=-1)
         log_probs = torch.log(probs)
         top_prob, top_idx = probs.max(dim=-1)
         logprobs.append(log_probs[top_idx].cpu().item())
-        top_token = tokenizer.convert_ids_to_tokens(top_idx.cpu().item())
-        top_logprobs.append({top_token: log_probs[top_idx].cpu().item()})
     
-    generated_text = tokenizer.decode(generated_tokens.cpu(), skip_special_tokens=True)
-    generation_time = time.time() - start_time
+    mean_logprob = sum(logprobs) / len(logprobs) if logprobs else 0
+    perplexity = math.exp(-mean_logprob) if mean_logprob != 0 else float('inf')
+    
+    # Memory metrics
+    memory_metrics = {
+        "peak_memory_mb": torch.cuda.max_memory_allocated(device) / 1024**2 if torch.cuda.is_available() else 0,
+        "current_memory_mb": torch.cuda.memory_allocated(device) / 1024**2 if torch.cuda.is_available() else 0,
+        "memory_utilization": torch.cuda.memory_allocated(device) / torch.cuda.get_device_properties(device).total_memory if torch.cuda.is_available() else 0,
+    }
+    
+    # Cache metrics
+    if hasattr(outputs, 'past_key_values') and outputs.past_key_values:
+        cache_size = sum(sum(x[0].nelement() * x[0].element_size() + 
+                           x[1].nelement() * x[1].element_size() 
+                           for x in layer) 
+                        for layer in outputs.past_key_values) / 1024**2
+        cache_length = outputs.past_key_values[0][0].shape[2]
+    else:
+        cache_size = 0
+        cache_length = 0 
+        
+    # Performance metrics
+    tokens_per_second = config.max_tokens / generation_time if generation_time > 0 else 0
+    
+    # Quality metrics
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    rouge_scores = scorer.score(reference_text, generated_text)
+    exact_match_score = 1 if reference_text.strip() == generated_text.strip() else 0
     
     return {
         'request': {
             'prompt': input_text,
+            'reference': reference_text,
             'temperature': config.temperature,
             'max_tokens': config.max_tokens,
-            'stop': None
         },
         'result': {
             "choices": [{
                 "text": generated_text,
                 "logprobs": {
-                    "tokens": tokens,
                     "token_logprobs": logprobs,
-                    "top_logprobs": top_logprobs,
-                    "text_offset": []
                 },
                 "finish_reason": "length"
             }],
-            "request_time": {
-                "batch_time": generation_time,
-                "batch_size": 1
+            "metrics": {
+                # Quality metrics
+                "perplexity": perplexity,
+                "exact_match": exact_match_score,
+                "rouge1_f": rouge_scores['rouge1'].fmeasure,
+                "rouge2_f": rouge_scores['rouge2'].fmeasure,
+                "rougeL_f": rouge_scores['rougeL'].fmeasure,
+                
+                # Performance metrics
+                "generation_time_ms": generation_time * 1000,
+                "tokens_per_second": tokens_per_second,
+                
+                # Memory metrics
+                **memory_metrics,
+                
+                # Cache metrics
+                "cache_size_mb": cache_size,
+                "cache_length": cache_length,
             }
         }
     }
