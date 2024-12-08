@@ -9,6 +9,7 @@ class DatasetConfig:
     config: Optional[str] = None
     input_prefix: str = ""  # e.g., "Context: ", "Question: "
     output_prefix: str = ""  # e.g., "Answer: "
+    max_samples: Optional[int] = None
 
 def get_default_dataset_configs() -> Dict[str, DatasetConfig]:
     """Get default dataset configurations with appropriate formatting"""
