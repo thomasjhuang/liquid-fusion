@@ -56,6 +56,7 @@ def run_strategy_tests(base_config, strategies, cache_sizes):
     results = {}
     
     for strategy in strategies:
+        strategy_results = []  # Track results for this strategy
         logger.info(f"\n{'='*50}")
         logger.info(f"Starting tests for {strategy} strategy")
         strategy_config = copy.deepcopy(base_config)
@@ -89,28 +90,40 @@ def run_strategy_tests(base_config, strategies, cache_sizes):
             strategy_config.recent_ratio = 0.1
             
         for cache_size in cache_sizes:
-            logger.info(f"\nTesting {strategy} with {cache_size}% cache")
-            logger.info("Loading model and tokenizer...")
-            
             try:
                 result = run_single_strategy_benchmark(
                     strategy_config, 
                     strategy=strategy, 
                     cache_size=cache_size
                 )
-                results[f"{strategy}_{cache_size}"] = result
-                logger.info(f"Completed {strategy} test with {cache_size}% cache")
+                if result:  # Only add if we got valid results
+                    results[f"{strategy}_{cache_size}"] = result
+                    strategy_results.append(result)
+                    logger.info(f"Completed {strategy} test with {cache_size}% cache")
+                else:
+                    logger.warning(f"No results returned for {strategy} with {cache_size}% cache")
                 
             except Exception as e:
                 logger.error(f"Error in {strategy} test with {cache_size}% cache: {str(e)}")
-                logger.error(f"Traceback: ", exc_info=True)
-                continue
+                logger.error("Traceback: ", exc_info=True)
+                # Add error information to results
+                results[f"{strategy}_{cache_size}"] = {
+                    "error": str(e),
+                    "status": "failed"
+                }
             
             # Force cleanup after each test
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
             
+        # Add summary for this strategy
+        if strategy_results:
+            results[f"{strategy}_summary"] = {
+                "num_successful_runs": len(strategy_results),
+                "cache_sizes_tested": cache_sizes
+            }
+    
     return results
 
 def main():

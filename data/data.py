@@ -147,3 +147,22 @@ class DatasetManager:
                 if dataset is not None:
                     datasets[key] = dataset
         return datasets
+
+    def get_dataloader(self):
+        """Get dataloader for the first dataset in config"""
+        if not self.config.datasets:
+            raise ValueError("No datasets configured")
+            
+        dataset_config = self.config.datasets[0]
+        batch_size = getattr(self.config, 'batch_size', 1)
+        
+        # Use first split if multiple are specified
+        split = dataset_config.splits[0]
+        if '[' in split:  # Handle slice notation like "test[:10]"
+            split = split.split('[')[0]
+            
+        return self.load_dataset(
+            dataset_config.name,
+            split=split,
+            batch_size=batch_size
+        )

@@ -8,6 +8,8 @@ from tqdm import tqdm
 from rouge_score import rouge_scorer
 import math
 import numpy as np
+import logging
+
 
 # Local imports
 from data.config import BenchmarkConfig
@@ -25,6 +27,9 @@ import os
 import copy
 import psutil
 from collections import defaultdict
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 def save_results_to_file(results: list, config: BenchmarkConfig):
     """Save benchmark results to a JSON file."""
@@ -218,7 +223,7 @@ def process_outputs(outputs, input_text, reference_text, tokenizer, start_time, 
         }
     }
 
-def save_benchmark_results(results: list, config: BenchmarkConfig, strategy: str, cache_size: int):
+def save_benchmark_results(results, config, strategy, cache_size):
     """Save benchmark results with detailed configuration info."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_name = config.model_name.split('/')[-1]
@@ -228,6 +233,20 @@ def save_benchmark_results(results: list, config: BenchmarkConfig, strategy: str
     
     # Create detailed filename
     filename = f"benchmark_results/{strategy}_{model_name}_cache{cache_size}_{timestamp}.json"
+    
+    def convert_tensors(obj):
+        """Recursively convert tensors to Python types"""
+        if torch.is_tensor(obj):
+            return obj.cpu().tolist()
+        elif isinstance(obj, dict):
+            return {key: convert_tensors(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_tensors(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(convert_tensors(item) for item in obj)
+        elif hasattr(obj, '__dict__'):
+            return convert_tensors(obj.__dict__)
+        return obj
     
     # Prepare metadata
     metadata = {
@@ -243,72 +262,194 @@ def save_benchmark_results(results: list, config: BenchmarkConfig, strategy: str
         "max_tokens": config.max_tokens,
         "temperature": config.temperature,
         "timestamp": timestamp,
-        "device": config.device
+        "device": str(config.device)
     }
+    
+    # Convert results to JSON-serializable format
+    serializable_results = convert_tensors(results)
     
     # Combine metadata with results
     full_results = {
         "metadata": metadata,
-        "results": results
+        "results": serializable_results
     }
     
     try:
         with open(filename, "w") as f:
             json.dump(full_results, f, indent=2)
-        print(f"\nResults saved to {filename}")
+        logger.info(f"\nResults saved to {filename}")
     except Exception as e:
-        print(f"Error saving results: {str(e)}")
+        logger.error(f"Error saving results: {str(e)}")
+        # Print the problematic data for debugging
+        logger.debug("Metadata:", metadata)
+        logger.debug("First result entry:", next(iter(serializable_results.items())) if isinstance(serializable_results, dict) else serializable_results[0] if serializable_results else None)
 
-def run_single_strategy_benchmark(config: BenchmarkConfig, strategy: str, cache_size: int):
-    """Run benchmark for a single strategy and cache size."""
-    print(f"\nTesting {strategy} strategy with {cache_size}% cache")
+def run_single_strategy_benchmark(config, strategy, cache_size, num_examples=5):
+    """Run benchmark with fast generation and deferred metrics computation"""
+    logger.info(f"\nTesting {strategy} strategy with {cache_size}% cache")
     
-    # Adjust config based on strategy
-    current_config = copy.deepcopy(config)
-    if strategy == "default" or strategy == "full":
-        current_config.attention_type = "default"
-        current_config.kv_cache_budget = 100  # Full cache for default attention
-    else:
-        current_config.attention_type = strategy
-        current_config.kv_cache_budget = cache_size
+    results = {
+        "metadata": {
+            "model_name": config.model_name,
+            "strategy": strategy,
+            "cache_size": cache_size,
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        },
+        "generations": []
+    }
     
     try:
-        deep_memory_cleanup()
-        
-        # Load model
-        model_loader = ModelLoader(current_config)
+        # Setup
+        logger.info("Cleaning up memory...")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        model_loader = ModelLoader(config)
         model, tokenizer = model_loader.load_model_and_tokenizer()
+        dataset_manager = DatasetManager(config, tokenizer)
+        dataloader = dataset_manager.get_dataloader()
+        device = next(model.parameters()).device
         
-        # Configure model based on strategy
-        if strategy not in ["default", "full"]:
-            print(f"Converting to {strategy} attention...")
-            model.config.kv_cache_budget = cache_size
-            
-            # Copy config parameters
-            for param in ['window_size', 'sink_size', 'sink_update_rate', 
-                         'heavy_ratio', 'recent_ratio']:
-                if hasattr(current_config, param):
-                    setattr(model.config, param, getattr(current_config, param))
-            
-            # Convert attention
-            if strategy == 'h2o':
-                model = convert_kvcache_llama_heavy_recent(model, model.config)
-            elif strategy == 'liquid_fusion':
-                model = convert_to_liquid_fusion(model, model.config)
-            elif strategy == 'streaming':
-                model = convert_to_streaming_attention(model, model.config)
-            elif strategy == 'local':
-                model = convert_kvcache_llama_heavy_recent(model, model.config)
+        # Fast generation loop
+        for i, batch in enumerate(tqdm(dataloader, desc="Generating outputs")):
+            if i >= num_examples:
+                break
+                
+            # Minimal processing for generation
+            with torch.no_grad():
+                inputs = {
+                    'input_ids': batch['input_ids'].to(device),
+                    'attention_mask': batch['attention_mask'].to(device),
+                }
+                
+                start_time = time.time()
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=64,
+                    do_sample=True,
+                    temperature=0.7,
+                    return_dict_in_generate=True,
+                )
+                generation_time = time.time() - start_time
+                
+                # Store minimal data needed for later processing
+                results["generations"].append({
+                    "input_text": batch.get('text', tokenizer.decode(batch['input_ids'][0])),
+                    "generated_ids": outputs.sequences[0].cpu().tolist(),
+                    "reference_text": batch.get('reference_text', batch.get('target', batch.get('label', ""))),
+                    "latency": generation_time
+                })
+                
+                # Immediate cleanup
+                del outputs
+                torch.cuda.empty_cache()
         
-        # Run benchmark
-        results = run_benchmark(current_config, save_results=False, verbose=False)
-        save_benchmark_results(results, current_config, strategy, cache_size)
+        # Compute metrics after all generations (optional)
+        if config.compute_metrics:
+            logger.info("Computing metrics...")
+            metrics = compute_metrics_from_generations(results["generations"], tokenizer)
+            results["metrics"] = metrics
+        
+        # Save results
+        save_benchmark_results(results, config, strategy, cache_size)
+        return results
         
     except Exception as e:
-        print(f"Error: {str(e)}")
-        
+        logger.error(f"Error during benchmark: {str(e)}", exc_info=True)
+        return results
     finally:
-        deep_memory_cleanup(model if 'model' in locals() else None)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+def compute_metrics_from_generations(generations, tokenizer):
+    """Compute metrics after all generations are complete"""
+    metrics = {
+        'per_example': [],
+        'summary': {}
+    }
+    
+    # Decode all generations at once
+    generated_texts = [tokenizer.decode(gen['generated_ids'], skip_special_tokens=True) 
+                      for gen in generations]
+    
+    # Process all examples
+    for gen, decoded_text in zip(generations, generated_texts):
+        example_metrics = {
+            'latency_ms': gen['latency'] * 1000,
+            'input_text': gen['input_text'],
+            'generated_text': decoded_text,
+            'reference_text': gen['reference_text']
+        }
+        metrics['per_example'].append(example_metrics)
+    
+    # Batch compute ROUGE scores
+    if any(m['reference_text'] for m in metrics['per_example']):
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        rouge_scores = [
+            scorer.score(str(m['reference_text']), str(m['generated_text']))
+            for m in metrics['per_example']
+        ]
+        
+        for i, scores in enumerate(rouge_scores):
+            metrics['per_example'][i].update({
+                'rouge1_f': scores['rouge1'].fmeasure,
+                'rouge2_f': scores['rouge2'].fmeasure,
+                'rougeL_f': scores['rougeL'].fmeasure
+            })
+    
+    # Compute summary statistics
+    metrics['summary'] = {
+        'avg_latency_ms': np.mean([m['latency_ms'] for m in metrics['per_example']]),
+        'avg_tokens_per_second': np.mean([len(m['generated_text'].split()) / (m['latency_ms'] / 1000) 
+                                        for m in metrics['per_example']])
+    }
+    
+    if 'rouge1_f' in metrics['per_example'][0]:
+        metrics['summary'].update({
+            'avg_rouge1_f': np.mean([m['rouge1_f'] for m in metrics['per_example']]),
+            'avg_rouge2_f': np.mean([m['rouge2_f'] for m in metrics['per_example']]),
+            'avg_rougeL_f': np.mean([m['rougeL_f'] for m in metrics['per_example']])
+        })
+    
+    return metrics
+
+def calculate_summary_metrics(metrics):
+    """Calculate comprehensive summary statistics"""
+    if not metrics:
+        return {}
+    
+    def safe_mean(key):
+        values = [m[key] for m in metrics if key in m and m[key] is not None]
+        return sum(values) / len(values) if values else None
+    
+    summary = {
+        "total_samples": len(metrics),
+        "avg_input_length": safe_mean("input_length"),
+        "avg_output_length": safe_mean("output_length"),
+        "avg_latency_ms": safe_mean("latency_ms"),
+        "avg_tokens_per_second": safe_mean("tokens_per_second"),
+        "avg_perplexity": safe_mean("perplexity"),
+    }
+    
+    # Quality metrics
+    if any('rouge1_fmeasure' in m for m in metrics):
+        summary.update({
+            "avg_rouge1_f1": safe_mean("rouge1_fmeasure"),
+            "avg_rouge2_f1": safe_mean("rouge2_fmeasure"),
+            "avg_rougeL_f1": safe_mean("rougeL_fmeasure"),
+            "exact_match_rate": safe_mean("exact_match")
+        })
+    
+    # Memory metrics
+    if any('kv_cache_size_mb' in m for m in metrics):
+        summary.update({
+            "avg_kv_cache_size_mb": safe_mean("kv_cache_size_mb"),
+            "max_kv_cache_size_mb": max(m["kv_cache_size_mb"] for m in metrics if "kv_cache_size_mb" in m),
+        })
+    
+    return summary
 
 def detailed_memory_check(label=""):
     """Detailed memory analysis with tensor tracking"""

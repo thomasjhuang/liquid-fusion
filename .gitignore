@@ -18,3 +18,5 @@ benchmarking*results*.json
 *_results.jsonl
 cache/
 .cache/
+scripts/benchmark_results
+benchmark_results/
