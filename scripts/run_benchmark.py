@@ -284,7 +284,7 @@ def save_benchmark_results(results, config, strategy, cache_size):
         logger.debug("Metadata:", metadata)
         logger.debug("First result entry:", next(iter(serializable_results.items())) if isinstance(serializable_results, dict) else serializable_results[0] if serializable_results else None)
 
-def run_single_strategy_benchmark(config, strategy, cache_size, num_examples=5):
+def run_single_strategy_benchmark(config, strategy, cache_size):
     """Run benchmark with fast generation and deferred metrics computation"""
     logger.info(f"\nTesting {strategy} strategy with {cache_size}% cache")
     
@@ -310,6 +310,9 @@ def run_single_strategy_benchmark(config, strategy, cache_size, num_examples=5):
         dataset_manager = DatasetManager(config, tokenizer)
         dataloader = dataset_manager.get_dataloader()
         device = next(model.parameters()).device
+        
+        # Get max samples from config or dataset size
+        num_examples = config.datasets[0].max_samples if config.datasets and config.datasets[0].max_samples else len(dataloader)
         
         # Fast generation loop
         for i, batch in enumerate(tqdm(dataloader, desc="Generating outputs")):
