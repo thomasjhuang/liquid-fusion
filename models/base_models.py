@@ -22,7 +22,10 @@ class ModelLoader:
             self.config.model_name,
             trust_remote_code=True
         )
-
+        
+        # Set max_position_embeddings
+        model_config.max_position_embeddings = self.config.max_position_embeddings
+        
         # Load model with config
         model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,

@@ -47,6 +47,7 @@ class BenchmarkConfig:
         dtype: str = "float16",
         device: str = "cuda",
         sequence_length: int = 512,
+        max_position_embeddings: int = 2048,
         
         # Dataset configuration
         datasets: List[DatasetConfig] = None,
@@ -71,6 +72,7 @@ class BenchmarkConfig:
         self.dtype = dtype
         self.device = device
         self.sequence_length = sequence_length
+        self.max_position_embeddings = max_position_embeddings
         self.datasets = datasets
         self.window_size = window_size
         self.stride = stride

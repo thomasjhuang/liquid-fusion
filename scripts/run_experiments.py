@@ -83,7 +83,7 @@ def run_strategy_tests(base_config, strategies, cache_sizes):
             logger.info("Configuring liquid fusion attention")
             strategy_config.attention_type = "liquid_fusion"
             strategy_config.window_size = 64
-            strategy_config.sink_size = 2
+            strategy_config.sink_size = 4
             strategy_config.sink_update_rate = 0.1
             strategy_config.heavy_ratio = 0.1
             strategy_config.recent_ratio = 0.1
