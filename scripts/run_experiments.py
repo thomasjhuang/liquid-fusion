@@ -7,6 +7,7 @@ import json
 import tqdm
 import copy
 from datetime import datetime
+import gc
 
 from data.config import BenchmarkConfig, DatasetConfig
 from models.base_models import ModelLoader
@@ -15,11 +16,11 @@ from scripts.run_benchmark import run_benchmark, run_single_strategy_benchmark
 
 logger = logging.getLogger(__name__)
 
-def setup_logging():
+def setup_logging(verbose=False):
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+        level=logging.INFO if verbose else logging.WARNING,
     )
 
 def get_device():
@@ -55,23 +56,31 @@ def run_strategy_tests(base_config, strategies, cache_sizes):
     results = {}
     
     for strategy in strategies:
+        logger.info(f"\n{'='*50}")
+        logger.info(f"Starting tests for {strategy} strategy")
         strategy_config = copy.deepcopy(base_config)
         
+        # Configure strategy
         if strategy == "full":
+            logger.info("Using default attention mechanism")
             strategy_config.attention_type = "default"
         elif strategy == "h2o":
+            logger.info("Configuring H2O attention")
             strategy_config.attention_type = "h2o"
             strategy_config.heavy_ratio = 0.1
             strategy_config.recent_ratio = 0.1
         elif strategy == "streaming":
+            logger.info("Configuring streaming attention")
             strategy_config.attention_type = "streaming"
             strategy_config.window_size = 64
             strategy_config.sink_size = 4
             strategy_config.sink_update_rate = 0.1
         elif strategy == "local":
+            logger.info("Configuring local attention")
             strategy_config.attention_type = "local"
             strategy_config.window_size = 64
         elif strategy == "liquid_fusion":
+            logger.info("Configuring liquid fusion attention")
             strategy_config.attention_type = "liquid_fusion"
             strategy_config.window_size = 64
             strategy_config.sink_size = 2
@@ -80,9 +89,27 @@ def run_strategy_tests(base_config, strategies, cache_sizes):
             strategy_config.recent_ratio = 0.1
             
         for cache_size in cache_sizes:
-            logger.info(f"Testing {strategy} with {cache_size}% cache")
-            result = run_single_strategy_benchmark(strategy_config, strategy=strategy, cache_size=cache_size)
-            results[f"{strategy}_{cache_size}"] = result
+            logger.info(f"\nTesting {strategy} with {cache_size}% cache")
+            logger.info("Loading model and tokenizer...")
+            
+            try:
+                result = run_single_strategy_benchmark(
+                    strategy_config, 
+                    strategy=strategy, 
+                    cache_size=cache_size
+                )
+                results[f"{strategy}_{cache_size}"] = result
+                logger.info(f"Completed {strategy} test with {cache_size}% cache")
+                
+            except Exception as e:
+                logger.error(f"Error in {strategy} test with {cache_size}% cache: {str(e)}")
+                logger.error(f"Traceback: ", exc_info=True)
+                continue
+            
+            # Force cleanup after each test
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             
     return results
 
@@ -102,14 +129,34 @@ def main():
     parser.add_argument("--cache-sizes", nargs="+", type=int,
                        default=[100, 80, 40, 20, 4],
                        help="Cache sizes to test")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--model-only", action="store_true", 
+                       help="Only test model loading without running experiments")
     
     args = parser.parse_args()
-    setup_logging()
+    setup_logging(verbose=args.verbose)
     
     if args.mini_test:
+        logger.info("Running mini test with 5 samples")
         args.max_samples = 5
-        args.cache_sizes = [100, 20]  # Reduced cache sizes for mini test
+        args.cache_sizes = [100, 20]
         
+    # Add model loading test
+    if args.model_only:
+        logger.info("Testing model loading only...")
+        base_config = get_base_config(args)
+        from models.base_models import ModelLoader
+        loader = ModelLoader(base_config)
+        model, tokenizer = loader.load_model_and_tokenizer()
+        logger.info("Model loaded successfully!")
+        return
+        
+    logger.info(f"Starting experiments with config:")
+    logger.info(f"Model: {args.model_name}")
+    logger.info(f"Device: {args.device}")
+    logger.info(f"Strategies: {args.strategies}")
+    logger.info(f"Cache sizes: {args.cache_sizes}")
+    
     base_config = get_base_config(args)
     results = run_strategy_tests(base_config, args.strategies, args.cache_sizes)
     
