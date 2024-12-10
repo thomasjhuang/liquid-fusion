@@ -8,7 +8,6 @@ import gc
 from transformers import AutoTokenizer
 from models.base_models import ModelLoader
 from models.attention.sparse_attention import convert_attention_type
-from data.metrics import BenchmarkMetrics, CacheMetrics
 from data.config import BenchmarkConfig
 import time, copy
 from models.streaming_llm.enable_streaming_llm import enable_streaming_llm
