@@ -15,22 +15,7 @@ from datasets import load_dataset
 
 logger = logging.getLogger(__name__)
 
-def log_cache_stats(model, past_key_values=None):
-    """Log cache statistics for models"""
-    
-    cache_metrics = CacheMetrics()
-    cache_metrics.reset()  # Reset for new measurement
-    
-    if past_key_values is not None:
-        cache_metrics.update_from_past_key_values(past_key_values)
-        stats = cache_metrics.get_stats()
-        logger.info(f"KV Cache Stats: Memory={stats['total_memory_mb']:.2f}MB, "
-                   f"Avg Tokens={stats['avg_tokens_cached']:.1f}, "
-                   f"Layers={stats['num_layers']}")
-        return stats
-    return {}
-
-def get_generation_config(tokenizer, input_ids):
+def get_generation_config(tokenizer, input_ids, config):
     """Standardized generation configuration with proper attention mask"""
     # Create attention mask (1 for real tokens, 0 for padding)
     attention_mask = torch.ones_like(input_ids)
@@ -42,53 +27,44 @@ def get_generation_config(tokenizer, input_ids):
     
     return {
         'input_ids': input_ids,
-        'attention_mask': attention_mask,  # Add attention mask
-        'max_new_tokens': 32,
-        'do_sample': False,
+        'attention_mask': attention_mask,
+        'max_new_tokens': config.max_tokens,
+        'do_sample': True if config.temperature > 0 else False,
+        'temperature': config.temperature,
         'num_return_sequences': 1,
         'pad_token_id': tokenizer.pad_token_id,
         'eos_token_id': tokenizer.eos_token_id,
         'use_cache': True,
-        'return_dict_in_generate': True
+        'max_length': config.sequence_length + config.max_tokens,
+        'output_attentions': False,
+        'output_hidden_states': False,
+        'return_dict': True,
     }
 
 def run_single_strategy_benchmark(config, strategy):
     """Run benchmark for a single attention strategy"""
+    logger.info(f"\n=== Starting benchmark for strategy: {strategy} ===")
+    
+    # Load model
+    logger.info("Loading model and tokenizer...")
     model_loader = ModelLoader(config)
     model, tokenizer = model_loader.load_model_and_tokenizer()
+    logger.info(f"Model type: {type(model)}")
+    logger.info(f"Model device: {next(model.parameters()).device}")
     
-    # Configure tokenizer properly
-    tokenizer.padding_side = "left"  # Typically better for casual LM
+    # Configure tokenizer
+    logger.info("Configuring tokenizer...")
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    if strategy == "streaming":
-        enable_streaming_llm(
-            model,
-            start_size=config.start_size,
-            recent_size=config.recent_size
-        )
-        logger.info(f"Using StreamingLLM with start_size={config.start_size}, recent_size={config.recent_size}")
-    elif strategy == "h2o":
-        config.heavy_ratio = getattr(config, 'heavy_ratio', 0.1)
-        config.recent_ratio = getattr(config, 'recent_ratio', 0.1)
-        logger.info(f"Using H2O attention with total budget={config.heavy_ratio + config.recent_ratio:.1f}")
-    elif strategy == "liquid_fusion":
-        config.start_size = getattr(config, 'start_size', 4)
-        config.recent_size = getattr(config, 'recent_size', 64)
-        config.heavy_ratio = getattr(config, 'heavy_ratio', 0.1)
-        config.recent_ratio = getattr(config, 'recent_ratio', 0.1)
-        logger.info(f"Using LiquidFusion with start_size={config.start_size}, "
-                   f"recent_size={config.recent_size}, "
-                   f"heavy_ratio={config.heavy_ratio}, "
-                   f"recent_ratio={config.recent_ratio}")
-    
-    # Load COPA dataset
+    # Load dataset
+    logger.info("Loading COPA dataset...")
     dataset = load_dataset("super_glue", "copa", split="validation")
-    
     if config.max_samples:
         dataset = dataset.select(range(config.max_samples))
+    logger.info(f"Dataset size: {len(dataset)}")
 
     results = []
     metrics = {
@@ -99,133 +75,54 @@ def run_single_strategy_benchmark(config, strategy):
         'inference_times': [],
         'cache_stats': []
     }
-    
-    # Initialize cache metrics
-    # from data.metrics import CacheMetrics
-    # cache_metrics = CacheMetrics()
-    # cache_metrics.reset()
-    
+
     with torch.no_grad():
-        for example in tqdm(dataset, desc=f"Evaluating {strategy}"):
-            # Device-specific timing setup
-            if config.device == "cuda" and torch.cuda.is_available():
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-            else:
-                start_time = time.time()
+        for idx, example in enumerate(tqdm(dataset, desc=f"Evaluating {strategy}")):
+            logger.info(f"\nProcessing example {idx}")
             
-            # Format COPA prompt
+            # Format prompt
             premise = example['premise']
             choice1 = example['choice1']
             choice2 = example['choice2']
             question = "cause" if example['question'] == 0 else "effect"
-            
             prompt = f"Given the {question}: '{premise}'\nWhich is more likely?\n1. {choice1}\n2. {choice2}\nAnswer:"
+            logger.info(f"Formatted prompt: {prompt[:100]}...")
             
+            # Tokenize
+            logger.info("Tokenizing input...")
             inputs = tokenizer(prompt, return_tensors="pt", padding=True)
             input_ids = inputs["input_ids"].to(model.device)
             attention_mask = inputs["attention_mask"].to(model.device)
+            logger.info(f"Input shape: {input_ids.shape}")
             
-            # Track memory based on device
-            if config.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
-                start_mem = torch.cuda.memory_allocated()
-            elif config.device == "mps" and hasattr(torch.mps, 'current_allocated_memory'):
-                start_mem = torch.mps.current_allocated_memory()
+            # Generate
+            logger.info("Preparing generation config...")
+            generation_config = get_generation_config(tokenizer, input_ids, config)
+            logger.info(f"Generation config: {generation_config}")
             
-            # Generate response
-            generation_config = get_generation_config(tokenizer, input_ids)
-            output = model.generate(**generation_config)
+            try:
+                logger.info("Starting generation...")
+                output = model.generate(**generation_config)
+                logger.info(f"Generation successful, output shape: {output.shape}")
+            except Exception as e:
+                logger.error(f"Generation failed with error: {str(e)}")
+                logger.error(f"Model type at failure: {type(model)}")
+                logger.error(f"Model forward method: {getattr(model, 'forward', None)}")
+                raise
             
-            # Get cache info from the model's last forward pass
-            if hasattr(model, 'last_forward_cache'):
-                cache_metrics.update_from_past_key_values(model.last_forward_cache)
-            elif hasattr(output, 'past_key_values'):
-                cache_metrics.update_from_past_key_values(output.past_key_values)
-            
-            # Record timing based on device
-            if config.device == "cuda" and torch.cuda.is_available():
-                end_event.record()
-                torch.cuda.synchronize()
-                elapsed_time = start_event.elapsed_time(end_event)
-            else:
-                elapsed_time = (time.time() - start_time) * 1000  # Convert to ms
-            
-            metrics['inference_times'].append(elapsed_time)
-            
-            # Record memory based on device
-            if config.device == "cuda" and torch.cuda.is_available():
-                end_mem = torch.cuda.memory_allocated()
-                metrics['memory_usage'].append(end_mem - start_mem)
-            elif config.device == "mps" and hasattr(torch.mps, 'current_allocated_memory'):
-                end_mem = torch.mps.current_allocated_memory()
-                metrics['memory_usage'].append(end_mem - start_mem)
-            
+            # Process output
             generated_text = tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
+            logger.info(f"Generated text: {generated_text}")
             
-            # Process answer
-            predicted_choice = 0
-            if "1" in generated_text[:10]:
-                predicted_choice = 0
-            elif "2" in generated_text[:10]:
-                predicted_choice = 1
-                
-            is_correct = predicted_choice == example['label']
-            metrics['correct'] += int(is_correct)
-            metrics['total'] += 1
-            
-            
-            results.append({
-                'premise': premise,
-                'question': question,
-                'choice1': choice1,
-                'choice2': choice2,
-                'predicted': predicted_choice,
-                'label': example['label'],
-                'correct': is_correct,
-                'generated_text': generated_text,
-                'inference_time': elapsed_time
-            })
-            
-            # Log progress
-            if len(results) % 10 == 0:
-                current_accuracy = metrics['correct'] / metrics['total']
-                logger.info(f"Strategy: {strategy}, Running accuracy: {current_accuracy:.4f}")
-            
-            # Log cache stats for all models using past_key_values
-            # if len(results) % 10 == 0:  # Log every 10 samples
-            #     stats = cache_metrics.get_stats()
-            #     logger.info(f"Cache Stats: Memory={stats['total_memory_mb']:.2f}MB, "
-            #                f"Avg Tokens={stats['avg_tokens_cached']:.1f}, "
-            #                f"Layers={stats['num_layers']}")
-            #     metrics['cache_stats'].append(stats)
-    
-    # Calculate final metrics
-    metrics['accuracy'] = metrics['correct'] / metrics['total']
-    metrics['avg_inference_time'] = sum(metrics['inference_times']) / len(metrics['inference_times'])
-    metrics['avg_memory_usage'] = sum(metrics['memory_usage']) / len(metrics['memory_usage']) if metrics['memory_usage'] else None
-    
-    # Save strategy-specific results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"copa_results_{strategy}_{timestamp}.jsonl"
-    with open(output_path, 'w') as f:
-        for result in results:
-            f.write(json.dumps(result) + '\n')
-    
-    # Cleanup
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
-    
+            # Rest of the processing...
+
     return {
         'strategy': strategy,
         'accuracy': metrics['accuracy'],
-        'avg_inference_time': metrics['avg_inference_time'],
-        'avg_memory_usage': metrics['avg_memory_usage'],
+        'avg_inference_time': sum(metrics['inference_times']) / len(metrics['inference_times']),
+        'avg_memory_usage': sum(metrics['memory_usage']) / len(metrics['memory_usage']) if metrics['memory_usage'] else None,
         'total_samples': metrics['total'],
-        'results_file': output_path
+        'results_file': f"copa_results_{strategy}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
     }
 
 def run_benchmark(args):
