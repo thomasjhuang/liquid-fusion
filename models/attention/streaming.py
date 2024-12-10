@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from data.metrics import CacheMetrics
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -55,6 +56,7 @@ class StreamingAttention(LlamaAttention):
         # Streaming specific attributes
         self.window_size = getattr(config, 'window_size', 256)
         self.sink_size = getattr(config, 'sink_size', 32)
+        self.cache_size = getattr(config, 'cache_size', 100)  # MB
         
     def forward(
         self,
@@ -76,8 +78,8 @@ class StreamingAttention(LlamaAttention):
         if past_key_value is not None and isinstance(past_key_value, DynamicCache):
             kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         
-        # Fix position handling for rotary embeddings
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        # Get rotary embeddings
+        cos, sin = self.rotary_emb(value_states)
         
         # Ensure position_ids are properly aligned with the window size
         if past_key_value is not None and isinstance(past_key_value, DynamicCache):
@@ -112,42 +114,11 @@ class StreamingAttention(LlamaAttention):
         # Apply rotary embeddings with corrected positions
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
-
-        if past_key_value is not None and isinstance(past_key_value, DynamicCache):
-            if self.layer_idx < len(past_key_value.key_cache):
-                past_key = past_key_value.key_cache[self.layer_idx]
-                past_value = past_key_value.value_cache[self.layer_idx]
-                
-                if past_key.size(2) > 0:
-                    # Calculate total length after concatenation
-                    total_length = past_key.size(2) + key_states.size(2)
-                    
-                    # If total length exceeds window size, trim the cache
-                    if total_length > self.window_size:
-                        # Keep sink tokens (first sink_size tokens) and recent tokens
-                        keep_length = self.window_size - key_states.size(2)
-                        if keep_length > self.sink_size:
-                            # Keep sink tokens and most recent tokens
-                            past_key = torch.cat([
-                                past_key[:, :, :self.sink_size],
-                                past_key[:, :, -(keep_length-self.sink_size):]
-                            ], dim=2)
-                            past_value = torch.cat([
-                                past_value[:, :, :self.sink_size],
-                                past_value[:, :, -(keep_length-self.sink_size):]
-                            ], dim=2)
-                        else:
-                            # Only keep sink tokens
-                            past_key = past_key[:, :, :self.sink_size]
-                            past_value = past_value[:, :, :self.sink_size]
-                
-                    key_states = torch.cat([past_key, key_states], dim=2)
-                    value_states = torch.cat([past_value, value_states], dim=2)
-
+        
         # Update cache if needed
+        cached_kv = None
         if use_cache:
             if isinstance(past_key_value, DynamicCache):
-                # Ensure we don't exceed window size while preserving sink tokens
                 if key_states.size(2) > self.window_size:
                     key_states = torch.cat([
                         key_states[:, :, :self.sink_size],
@@ -158,8 +129,9 @@ class StreamingAttention(LlamaAttention):
                         value_states[:, :, -(self.window_size-self.sink_size):]
                     ], dim=2)
                 past_key_value.update(key_states, value_states, self.layer_idx)
+                cached_kv = past_key_value
             else:
-                past_key_value = (key_states, value_states)
+                cached_kv = (key_states, value_states)
 
         # Calculate attention scores
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -200,23 +172,11 @@ class StreamingAttention(LlamaAttention):
         attn_output = self.o_proj(attn_output)
 
         # Add safety checks for cache
-        if past_key_value is not None and isinstance(past_key_value, DynamicCache):
-            # Validate cache indices
-            if self.layer_idx >= len(past_key_value.key_cache):
-                past_key_value.key_cache.extend([None] * (self.layer_idx + 1 - len(past_key_value.key_cache)))
-                past_key_value.value_cache.extend([None] * (self.layer_idx + 1 - len(past_key_value.value_cache)))
-            
-            # Ensure cache tensors are on correct device
-            if past_key_value.key_cache[self.layer_idx] is not None:
-                past_key_value.key_cache[self.layer_idx] = past_key_value.key_cache[self.layer_idx].to(hidden_states.device)
-                past_key_value.value_cache[self.layer_idx] = past_key_value.value_cache[self.layer_idx].to(hidden_states.device)
-
-        # Free memory explicitly
-        if past_key_value is not None and isinstance(past_key_value, DynamicCache):
-            past_key_value.key_cache[self.layer_idx] = past_key_value.key_cache[self.layer_idx].detach()
-            past_key_value.value_cache[self.layer_idx] = past_key_value.value_cache[self.layer_idx].detach()
-
-        return attn_output, attn_weights if output_attentions else None, past_key_value
+        if use_cache:
+            if hasattr(cached_kv, 'to_legacy_cache'):
+                cached_kv = cached_kv.to_legacy_cache()
+        
+        return attn_output, attn_weights if output_attentions else None, cached_kv
 
 def convert_to_streaming_attention(model, config):
     """Convert a model to use streaming attention."""

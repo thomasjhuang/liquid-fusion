@@ -39,54 +39,52 @@ class BenchmarkConfig:
     def __init__(
         self,
         model_name: str,
-        model_type: str,
-        attention_type: str = "default",
-        # General parameters
-        max_tokens: int = 128,
-        temperature: float = 0.7,
-        dtype: str = "float16",
+        model_type: str = "llama",
+        # Core settings
         device: str = "cuda",
-        sequence_length: int = 512,
+        dtype: str = "bfloat16",
+        # Generation settings
+        max_tokens: int = 8,
+        temperature: float = 0.1,
+        # Sequence handling
+        sequence_length: int = 256,
         max_position_embeddings: int = 2048,
-        compute_metrics: bool = False,
-        
-        # Dataset configuration
+        # StreamingLLM specific
+        start_size: int = 4,
+        recent_size: int = 64,
+        # Sparse attention specific
+        window_size: int = 256,
+        stride: int = 128,
+        # Dataset config
         datasets: List[DatasetConfig] = None,
-        
-        # Sparse attention parameters
-        window_size: Optional[int] = None,
-        stride: Optional[int] = None,
-        
-        # H2O attention parameters
-        heavy_ratio: Optional[float] = None,
-        recent_ratio: Optional[float] = None,
-        
-        # Streaming attention parameters
-        sink_size: Optional[int] = None,
-        sink_update_rate: Optional[float] = None
+        # Sampling control
+        max_samples: Optional[int] = None,
+        # Strategy control
+        strategies: List[str] = None,
+        # Metrics control
+        enable_cache_metrics: bool = False
     ):
         self.model_name = model_name
         self.model_type = model_type
-        self.attention_type = attention_type
+        self.device = device
+        self.dtype = dtype
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self.dtype = dtype
-        self.device = device
         self.sequence_length = sequence_length
         self.max_position_embeddings = max_position_embeddings
-        self.compute_metrics = compute_metrics
-        self.datasets = datasets
+        self.start_size = start_size
+        self.recent_size = recent_size
         self.window_size = window_size
         self.stride = stride
-        self.heavy_ratio = heavy_ratio
-        self.recent_ratio = recent_ratio
-        self.sink_size = sink_size
-        self.sink_update_rate = sink_update_rate
-
-    def switch_dataset(self, dataset_name: str):
-        """Switch datasets based on a string identifier."""
-        dataset_configs = get_default_dataset_configs()
-        if dataset_name in dataset_configs:
-            self.datasets = [dataset_configs[dataset_name]]
-        else:
-            raise ValueError(f"Dataset '{dataset_name}' not recognized. Available datasets: {list(dataset_configs.keys())}")
+        self.max_samples = max_samples
+        self.strategies = strategies or ["full"]
+        self.enable_cache_metrics = enable_cache_metrics
+        self.datasets = datasets or [
+            DatasetConfig(
+                name="super_glue",
+                config="copa",
+                splits=["validation"],
+                input_prefix="Given the premise: ",
+                output_prefix="Answer: "
+            )
+        ]

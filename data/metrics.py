@@ -1,8 +1,10 @@
 import torch
 import numpy as np
 import time
-from typing import Dict
+from typing import Dict, DefaultDict
 from tqdm import tqdm
+from threading import Lock
+from collections import defaultdict
 
 class BenchmarkMetrics:
     
@@ -157,3 +159,64 @@ class BenchmarkMetrics:
             "cache_ratio": cache_params / total_params,
             "cache_size_mb": cache_params * 4 / (1024 * 1024)  # Assuming float32
         }
+
+class CacheMetrics:
+    _instance = None
+    _lock = Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(CacheMetrics, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if not self._initialized:
+            self.reset()
+            self._initialized = True
+            self._lock = Lock()
+    
+    def reset(self):
+        """Reset all metrics"""
+        self.layer_metrics = defaultdict(lambda: {
+            'memory_usage': 0,
+            'tokens_cached': 0,
+            'max_length': 0
+        })
+    
+    def update_from_past_key_values(self, past_key_values):
+        """Update metrics from model's past_key_values"""
+        if past_key_values is None:
+            return
+            
+        with self._lock:
+            for layer_idx, (key_states, value_states) in enumerate(past_key_values):
+                layer_id = f"layer_{layer_idx}"
+                
+                # Calculate memory usage in MB
+                memory_mb = (
+                    (key_states.nelement() * key_states.element_size() + 
+                     value_states.nelement() * value_states.element_size()) 
+                    / (1024 * 1024)
+                )
+                
+                self.layer_metrics[layer_id].update({
+                    'memory_usage': memory_mb,
+                    'tokens_cached': key_states.shape[1],  # seq_len dimension
+                    'max_length': max(self.layer_metrics[layer_id]['max_length'], key_states.shape[1])
+                })
+    
+    def get_stats(self) -> Dict:
+        """Get current cache statistics"""
+        with self._lock:
+            total_memory = sum(m['memory_usage'] for m in self.layer_metrics.values())
+            avg_tokens = np.mean([m['tokens_cached'] for m in self.layer_metrics.values()]) if self.layer_metrics else 0
+            
+            return {
+                'total_memory_mb': total_memory,
+                'avg_tokens_cached': avg_tokens,
+                'num_layers': len(self.layer_metrics),
+                'per_layer': dict(self.layer_metrics)
+            }

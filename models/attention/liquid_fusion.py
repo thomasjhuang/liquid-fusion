@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, apply_rotary_pos_emb
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache
+from models.attention.cache import CombinedCache
 import copy
 
 class LiquidFusion(nn.Module):
@@ -47,6 +48,22 @@ class LiquidFusion(nn.Module):
             device=getattr(config, 'device', None)
         )
 
+        # Add StreamingLLM components
+        self.start_size = config.start_size
+        self.recent_size = config.recent_size
+        
+        # Add H2O components
+        self.heavy_ratio = config.heavy_ratio
+        self.recent_ratio = config.recent_ratio
+        
+        # Initialize combined cache
+        self.kv_cache = CombinedCache(
+            start_size=self.start_size,
+            recent_size=self.recent_size,
+            heavy_ratio=self.heavy_ratio,
+            recent_ratio=self.recent_ratio
+        )
+
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
@@ -57,25 +74,29 @@ class LiquidFusion(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs
+        use_cache: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project input to query, key, value
+        # Project and reshape states
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-
-        # Reshape to (batch_size, num_heads, seq_length, head_dim)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Apply rotary embeddings if position_ids are provided
+        
+        # Cache keys before RoPE (StreamingLLM approach)
+        pre_rope_keys = key_states.clone()
+        
+        # Apply rotary embeddings
         if position_ids is not None:
             cos, sin = self.rotary_emb(value_states, seq_len=q_len)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
+
+        # Combine past cache if exists
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         # Compute attention scores
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -83,16 +104,19 @@ class LiquidFusion(nn.Module):
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
             
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        # Use fp32 for better stability (from H2O)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         
-        # Compute attention output
+        # Update cache using both methods
+        if use_cache:
+            past_key_value = self.kv_cache.update(
+                pre_rope_keys,  # StreamingLLM: store pre-RoPE keys
+                value_states,
+                attn_weights.detach(),  # H2O: use attention scores for heavy-hitter detection
+            )
+
         attn_output = torch.matmul(attn_weights, value_states)
-        
-        # Reshape back to (batch_size, seq_length, hidden_size)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-        
-        # Final projection
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights if output_attentions else None, past_key_value

@@ -20,3 +20,4 @@ cache/
 .cache/
 scripts/benchmark_results
 benchmark_results/
+copa_*
