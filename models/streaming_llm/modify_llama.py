@@ -17,13 +17,10 @@ from transformers.utils import add_start_docstrings_to_model_forward, logging
 
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
-import contextlib
 
-from transformers import LlamaModel
 from transformers.models.llama.modeling_llama import LlamaAttention, repeat_kv, apply_rotary_pos_emb, rotate_half
 
 from types import MethodType
-from MoA.attention.density_calculation import streamingllm_attention_density, streamingllm_kv_cache_density
 
 logger = logging.get_logger(__name__)
 
@@ -539,3 +536,33 @@ class StreamingllmDynamicCache(Cache):
             self.value_cache[layer_idx] = self.value_cache[layer_idx].index_select(
                 0, beam_idx.to(device)
             )
+
+def streamingllm_attention_density(
+    global_size: int = 4,
+    band_size: int = 1024,
+    kv_seq_len: int = 8192,
+):  
+    num_total = 0
+    num_attended = 0
+
+    for i in range(kv_seq_len):
+        for j in range(kv_seq_len):
+            if i < j:
+                continue
+            num_total += 1
+
+            if (j < global_size) or (i - j < band_size):
+                num_attended += 1
+    
+    return num_attended / num_total
+
+def streamingllm_kv_cache_density(
+    global_size: int = 4,
+    band_size: int = 1024,
+    kv_seq_len: int = 8192,
+):
+    if global_size + band_size > kv_seq_len:
+        return 1.0
+
+    else:
+        return (global_size + band_size) / kv_seq_len
