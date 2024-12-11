@@ -44,47 +44,44 @@ class BenchmarkConfig:
         device: str = "cuda",
         dtype: str = "bfloat16",
         # Generation settings
-        max_tokens: int = 8,
-        temperature: float = 0.1,
-        # Sequence handling
-        sequence_length: int = 256,
-        max_position_embeddings: int = 2048,
+        max_new_tokens: int = 128,  # For summarization
+        temperature: float = 0.0,
+        # Sequence length settings
+        sequence_length: int = 4096,  # Increased for long documents
+        max_position_embeddings: int = 4096,
+        # Attention strategy settings
+        strategies: List[str] = None,
         # StreamingLLM specific
         start_size: int = 4,
-        recent_size: int = 64,
-        # Sparse attention specific
-        window_size: int = 256,
-        stride: int = 128,
+        recent_size: int = 3496,  # Following StreamingLLM paper
+        # H2O specific
+        heavy_budget: int = 800,    # ~20% for heavy hitters
+        recent_budget: int = 800,   # ~20% for recent tokens
         # Dataset config
         datasets: List[DatasetConfig] = None,
-        # Sampling control
         max_samples: Optional[int] = None,
-        # Strategy control
-        strategies: List[str] = None,
-        # Metrics control
-        enable_cache_metrics: bool = False
     ):
         self.model_name = model_name
         self.model_type = model_type
         self.device = device
         self.dtype = dtype
-        self.max_tokens = max_tokens
+        self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.sequence_length = sequence_length
         self.max_position_embeddings = max_position_embeddings
+        self.strategies = strategies or ["base"]
+        # StreamingLLM
         self.start_size = start_size
         self.recent_size = recent_size
-        self.window_size = window_size
-        self.stride = stride
-        self.max_samples = max_samples
-        self.strategies = strategies or ["full"]
-        self.enable_cache_metrics = enable_cache_metrics
+        # H2O
+        self.heavy_budget = heavy_budget
+        self.recent_budget = recent_budget
         self.datasets = datasets or [
             DatasetConfig(
-                name="super_glue",
-                config="copa",
-                splits=["validation"],
-                input_prefix="Given the premise: ",
-                output_prefix="Answer: "
+                name="ccdv/pubmed-summarization",
+                splits=["test"],
+                input_prefix="Summarize: ",
+                output_prefix="Summary: "
             )
         ]
+        self.max_samples = max_samples

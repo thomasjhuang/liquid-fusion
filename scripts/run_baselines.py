@@ -3,6 +3,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import pandas as pd
 from tqdm import tqdm
+import argparse
+import os
+import json
+from datetime import datetime
+from models.MoA.models.llama.modeling_llama import LlamaModel_use_streamingllm_attention
 
 def evaluate_copa(model_name, 
                  use_streamingLLM=False,
@@ -20,16 +25,21 @@ def evaluate_copa(model_name,
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    # Configure model loading with proper rope scaling for Llama 3
+    # Configure model loading with proper dtype based on device
     model_kwargs = {
-        "torch_dtype": torch.bfloat16,
         "device_map": device,
     }
     
+    # Set dtype based on device
+    if device == "mps":
+        model_kwargs["torch_dtype"] = torch.float16  # Use float16 for MPS
+    else:
+        model_kwargs["torch_dtype"] = torch.bfloat16  # Use bfloat16 for other devices
+    
     if "llama-3" in model_name.lower():
         model_kwargs["rope_scaling"] = {
-            "type": "linear",  # Using linear scaling for Llama 3
-            "factor": 2.0     # Standard scaling factor
+            "type": "linear",
+            "factor": 2.0
         }
     
     model = AutoModelForCausalLM.from_pretrained(
@@ -38,7 +48,6 @@ def evaluate_copa(model_name,
     ).eval()
     
     if use_streamingLLM:
-        from models.MoA.models.llama.modeling_llama import LlamaModel_use_streamingllm_attention
         LlamaModel_use_streamingllm_attention(
             model.model,
             global_size=global_size,
@@ -109,3 +118,71 @@ def evaluate_copa(model_name,
     print(f"\nFinal accuracy: {accuracy:.2%}")
     
     return pd.DataFrame(results), accuracy
+
+def main():
+    parser = argparse.ArgumentParser(description='Evaluate COPA task with different model configurations')
+    
+    # Required arguments
+    parser.add_argument('--model_name', type=str, required=True,
+                      help='Name or path of the model to evaluate')
+    
+    # Optional arguments
+    parser.add_argument('--device', type=str, default='cuda',
+                      choices=['cuda', 'cpu', 'mps'],
+                      help='Device to run the model on')
+    parser.add_argument('--use_streamingLLM', action='store_true',
+                      help='Whether to use StreamingLLM attention')
+    parser.add_argument('--global_size', type=int, default=4,
+                      help='Global size for StreamingLLM')
+    parser.add_argument('--band_size', type=int, default=64,
+                      help='Band size for StreamingLLM')
+    parser.add_argument('--max_length', type=int, default=512,
+                      help='Maximum sequence length')
+    parser.add_argument('--output_dir', type=str, default='results',
+                      help='Directory to save results')
+    
+    args = parser.parse_args()
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Run evaluation
+    print(f"Starting evaluation with model: {args.model_name}")
+    results_df, accuracy = evaluate_copa(
+        model_name=args.model_name,
+        use_streamingLLM=args.use_streamingLLM,
+        global_size=args.global_size,
+        band_size=args.band_size,
+        max_length=args.max_length,
+        device=args.device
+    )
+    
+    # Save results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name_safe = args.model_name.replace('/', '_')
+    
+    # Save DataFrame to CSV
+    csv_path = os.path.join(args.output_dir, f"{model_name_safe}_{timestamp}_results.csv")
+    results_df.to_csv(csv_path, index=False)
+    
+    # Save configuration and metrics
+    config = {
+        'model_name': args.model_name,
+        'use_streamingLLM': args.use_streamingLLM,
+        'global_size': args.global_size,
+        'band_size': args.band_size,
+        'max_length': args.max_length,
+        'device': args.device,
+        'accuracy': accuracy,
+        'timestamp': timestamp
+    }
+    
+    config_path = os.path.join(args.output_dir, f"{model_name_safe}_{timestamp}_config.json")
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    print(f"\nResults saved to {args.output_dir}")
+    print(f"Final accuracy: {accuracy:.2%}")
+
+if __name__ == "__main__":
+    main()

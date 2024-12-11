@@ -1,206 +1,192 @@
-# LLama copied from H2O
-
-import os
-import pdb
-import copy
 import math
-import numpy as np
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+from types import MethodType
 
 import torch
 from torch import nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
+from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb, repeat_kv
+
+def H2O_reset_masks(self):
+    self.attention_masks_next = None 
+    # self.heavy_budget = None
+    # self.recent_budget = None
+    # self.cache_budget = None
+    self.previous_scores = None
+
+def H2O_shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+    return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
 
-from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaAttention, apply_rotary_pos_emb
+def H2O_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    **kwargs
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
+    query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+    kv_seq_len = key_states.shape[-2]
 
-__all__ = ['convert_kvcache_llama_heavy_recent', 'LlamaAttention_heavy_hitter']
+    if q_len > 1:
+        # prefill
+        self._reset_masks()
 
+    if q_len > 1:
+        assert self.attention_masks_next is None
 
-def local_heavy_hitter_mask(attn_weights, heavy_budget):
-
-    # attn_weights (BS, head, query, keys)
-    dtype_attn_weights = attn_weights.dtype
-    seq_length = attn_weights.shape[-1]
-    padding_length = 0
-
-    offset = torch.finfo(attn_weights.dtype).min
-    tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype_attn_weights)
-
-    accumulated_attention_score = torch.sum(tmp_attn[:,:,padding_length:heavy_budget+padding_length,:], dim=-2) #(head, keys)
-    accumulated_attention_score[:,:,heavy_budget+padding_length:] = 0
-    accumulated_attention_score[:,:,:padding_length] = 0
-
-    mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
-    mask_bottom[:,:, padding_length:heavy_budget+padding_length, padding_length:heavy_budget+padding_length] = True
-
-    for token_index in range(heavy_budget+padding_length, seq_length):
-
-        tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
-        _, tmp_topk_index = accumulated_attention_score.topk(k=heavy_budget-1, dim=-1)
-        zeros_index = torch.zeros_like(tmp_attn_index, dtype=torch.bool)
-        mask_bottom_index = zeros_index.scatter(-1, tmp_topk_index, True) #(head, keys)
-        mask_bottom_index[:,:, token_index] = True
-
-        mask_bottom[:,:,token_index,:] = mask_bottom_index
-        accumulated_attention_score += tmp_attn_index
-        accumulated_attention_score = accumulated_attention_score * mask_bottom_index
-
-    return mask_bottom
-
-
-class LlamaAttention_heavy_hitter(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.max_position_embeddings = config.max_position_embeddings
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+    if past_key_value is not None:
+        if self.layer_idx is None:
             raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
+                f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                "with a layer index."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-        self.heavy_budget_ratio = config.heavy_ratio
-        self.recent_budget_ratio = config.recent_ratio
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    # [bsz, nh, t, hd]
 
+    if past_key_value is not None:
+        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+    # assert self.num_key_value_groups == 1
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+            f" {attn_weights.size()}"
+        )
+    
+    if attention_mask is not None:
+        assert attention_mask.dtype == attn_weights.dtype
 
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-
-        # Fix: Remove seq_len argument
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        # [bsz, nh, t, hd]
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+    if attention_mask is not None:
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
             )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
-
-        ### Heavy + Recent
-        heavy_budget = int(self.heavy_budget_ratio * attn_weights.shape[-1])
-        recent_budget = int(self.recent_budget_ratio * attn_weights.shape[-1])
+        attn_weights = attn_weights + attention_mask
+        # attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
 
-        # # Heavy Hitter Mask (Based on local statistics)
-        # if heavy_budget > 0:
-        #     mask_bottom = local_heavy_hitter_mask(attn_weights, heavy_budget) # Default: No padding applied to input
-        # else:
-        #     mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
+    if self.attention_masks_next is not None:
+        attn_weights = attn_weights * self.attention_masks_next + (1 - self.attention_masks_next) * torch.finfo(attn_weights.dtype).min
 
-        # ones = torch.ones_like(attn_weights, dtype=torch.bool)
-        # ones = torch.triu(ones, diagonal=-recent_budget)
-        # mask_bottom = torch.logical_or(mask_bottom, ones)
+    # # upcast attention to fp32
+    # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-        # mask_bottom = torch.tril(mask_bottom, diagonal=0)
-
-        # # mask_bottom = ones
-        # attn_weights[~mask_bottom] = torch.min(attention_mask)
-
-
-
-        # Heavy Hitter Mask (Based on global statistics)
-        tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
-        tmp_sum = torch.sum(tmp_attn, dim=-2)
-        _, tmp_topk = tmp_sum.topk(k=heavy_budget, dim=-1)
-
-        zeros = torch.zeros_like(tmp_sum, dtype=torch.bool)
-        mask_bottom = zeros.scatter(-1, tmp_topk, True).unsqueeze(2)
-        mask_bottom = mask_bottom.expand(mask_bottom.shape[0], mask_bottom.shape[1], attn_weights.shape[-2], mask_bottom.shape[-1])
-
-        ones = torch.ones_like(attn_weights, dtype=torch.bool)
-        ones = torch.tril(ones, diagonal=recent_budget)
-        ones = torch.triu(ones, diagonal=-recent_budget)
-        mask_bottom = torch.logical_or(mask_bottom, ones)
-        # mask_bottom = ones
-        attn_weights[~mask_bottom] = torch.finfo(attn_weights.dtype).min
-
-
-        # upcast attention to fp32
+    # upcast attention to fp32
+    if q_len < 8192:
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+    elif q_len < 16384:
+        attn_weights[:, :self.num_heads // 2, :, :] = nn.functional.softmax(attn_weights[:, :self.num_heads // 2, :, :], dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights[:, self.num_heads // 2:, :, :] = nn.functional.softmax(attn_weights[:, self.num_heads // 2:, :, :], dim=-1, dtype=torch.float32).to(query_states.dtype)
+    else:
+        attn_weights[:, :self.num_heads // 3, :, :] = nn.functional.softmax(attn_weights[:, :self.num_heads // 3, :, :], dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights[:, self.num_heads // 3:2 * self.num_heads // 3, :, :] = nn.functional.softmax(attn_weights[:, self.num_heads // 3:2 * self.num_heads // 3, :, :], dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights[:, 2 * self.num_heads // 3:, :, :] = nn.functional.softmax(attn_weights[:, 2 * self.num_heads // 3:, :, :], dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+    # attn_weights (BS, heads, q-tokens, k-tokens) 16, 15, 15 // 16, 1, 16
+    if q_len < 8192:
+        current_scores_sum = attn_weights.sum(0).sum(1) # (heads, k-tokens)
+    elif q_len < 16384:
+        current_scores_sum = torch.zeros(self.num_heads, kv_seq_len, dtype=attn_weights.dtype, device=attn_weights.device)
+        current_scores_sum[:self.num_heads // 2, :] = attn_weights[:, :self.num_heads // 2, :, :].sum(0).sum(1)
+        current_scores_sum[self.num_heads // 2:, :] = attn_weights[:, self.num_heads // 2:, :, :].sum(0).sum(1)
+    else:
+        current_scores_sum = torch.zeros(self.num_heads, kv_seq_len, dtype=attn_weights.dtype, device=attn_weights.device)
+        current_scores_sum[:self.num_heads // 3, :] = attn_weights[:, :self.num_heads // 3, :, :].sum(0).sum(1)
+        current_scores_sum[self.num_heads // 3:2 * self.num_heads // 3, :] = attn_weights[:, self.num_heads // 3:2 * self.num_heads // 3, :, :].sum(0).sum(1)
+        current_scores_sum[2 * self.num_heads // 3:, :] = attn_weights[:, 2 * self.num_heads // 3:, :, :].sum(0).sum(1)
+    # offset = attn_weights.gt(0).sum(0).sum(1)
+    
+    # Accumulate attention scores
+    if not self.previous_scores == None:
+        current_scores_sum[:, :-1] += self.previous_scores #(Enlarged Sequence)
+    # else:
+    #     self.heavy_budget = int(self.heavy_budget_ratio * current_scores_sum.shape[-1])
+    #     self.recent_budget = int(self.recent_budget_ratio * current_scores_sum.shape[-1])
+    #     self.cache_budget = self.heavy_budget + self.recent_budget
 
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # current_scores_sum = current_scores_sum / offset
+    dtype_attn_weights = attn_weights.dtype
+    attn_weights_devices = attn_weights.device
+    assert attn_weights.shape[0] == 1
+    self.previous_scores = current_scores_sum #(heads, k-tokens)
+    attn_mask = torch.ones(current_scores_sum.shape[0], current_scores_sum.shape[1]+1, dtype=dtype_attn_weights, device=attn_weights_devices)
 
-        attn_output = self.o_proj(attn_output)
+    attn_tokens_all = self.previous_scores.shape[-1]
 
-        if not output_attentions:
-            attn_weights = None
+    if attn_tokens_all > self.cache_budget:
+        # activate most recent k-cache
+        if not self.recent_budget == 0:
+            attn_mask[:, :-self.recent_budget] = 0
+            selected_set = self.previous_scores[:, :-self.recent_budget]
+        else:
+            # activate historical best self.cache_budget - self.recent_budget tokens.
+            # self.previous_scores # (k-Cache - 1)
+            selected_set = self.previous_scores
 
-        return attn_output, attn_weights, past_key_value
+        if not self.heavy_budget == 0:
+            _, keep_topk = selected_set.topk(k=self.heavy_budget, dim=-1, largest=True)
+            attn_mask = attn_mask.scatter(-1, keep_topk, 1)
 
+    self.attention_masks_next = attn_mask.unsqueeze(0).unsqueeze(2)
 
-def convert_kvcache_llama_heavy_recent(model, config):
+    score_mask = attn_mask[:,:-1]
+    score_mask[:, -self.recent_budget:] = 1
+    self.previous_scores = self.previous_scores * score_mask
+
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2)
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+    attn_output = self.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
+
+def convert_kvcache_llama_heavy_recent(model, heavy_budget, recent_budget):
 
     for name, module in reversed(model._modules.items()):
 
         if len(list(module.children())) > 0:
-            model._modules[name] = convert_kvcache_llama_heavy_recent(module, config)
+            model._modules[name] = convert_kvcache_llama_heavy_recent(module, heavy_budget, recent_budget)
 
         if isinstance(module, LlamaAttention):
-            model._modules[name] = LlamaAttention_heavy_hitter(config)
-
+            model._modules[name].forward = MethodType(H2O_attention_forward, model._modules[name])
+            model._modules[name]._reset_masks = MethodType(H2O_reset_masks, model._modules[name])
+            model._modules[name]._shape = MethodType(H2O_shape, model._modules[name])
+            # model._modules[name].heavy_budget_ratio = heavy_ratio
+            # model._modules[name].recent_budget_ratio = recent_ratio
+            model._modules[name].attention_masks_next = None
+            model._modules[name].heavy_budget = heavy_budget
+            model._modules[name].recent_budget = recent_budget
+            model._modules[name].cache_budget = heavy_budget + recent_budget
+            model._modules[name].previous_scores = None
     return model

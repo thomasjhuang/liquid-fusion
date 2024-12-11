@@ -21,3 +21,7 @@ cache/
 scripts/benchmark_results
 benchmark_results/
 copa_*
+build
+results
+working_liquid_fusion.py
+old_run_benchmark.py
