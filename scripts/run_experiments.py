@@ -27,7 +27,7 @@ device = (
 print(f"Using device: {device}")
 
 streaming_config = BenchmarkConfig(
-    model_name="meta-llama/Llama-2-7b-chat-hf",
+    model_name="TinyLlama/TinyLlama-1.1B-Chat-v0.1",
     model_type="llama",
     device=device,
     dtype="float16",
@@ -39,9 +39,10 @@ streaming_config = BenchmarkConfig(
     max_samples=10,
     datasets=[
         DatasetConfig(
-            name="ccdv/pubmed-summarization",
+            name="csebuetnlp/xlsum",
             splits=["test"],
-            input_prefix="Summarize this medical research article:\n\n",
+            config='english',
+            input_prefix="Summarize this article:\n\n",
             output_prefix="\n\nSummary:",
             max_samples=10
         )
@@ -61,9 +62,10 @@ h2o_config = BenchmarkConfig(
     max_samples=10,
     datasets=[
         DatasetConfig(
-            name="ccdv/pubmed-summarization",
+            name="csebuetnlp/xlsum",
             splits=["test"],
-            input_prefix="Summarize the following medical article:\n\n",
+            config='en',
+            input_prefix="Summarize this article:\n\n",
             output_prefix="\n\nSummary:",
             max_samples=10
         )
@@ -83,9 +85,10 @@ liquid_config = BenchmarkConfig(
     max_samples=10,
     datasets=[
         DatasetConfig(
-            name="ccdv/pubmed-summarization",
+            name="csebuetnlp/xlsum",
             splits=["test"],
-            input_prefix="Summarize the following medical article:\n\n",
+            config='en',
+            input_prefix="Summarize this article:\n\n",
             output_prefix="\n\nSummary:",
             max_samples=10
         )

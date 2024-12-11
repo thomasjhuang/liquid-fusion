@@ -84,6 +84,7 @@ def run_single_strategy_benchmark(config, strategy):
     # Load Pubmed dataset instead of COPA
     dataset = load_dataset(
         config.datasets[0].name,
+        "english",
         split=config.datasets[0].splits[0],
         streaming=True  # Enable streaming
     )
@@ -103,7 +104,7 @@ def run_single_strategy_benchmark(config, strategy):
     try:
         for sample in tqdm(dataset, desc=f"Evaluating {strategy}"):
             # Format prompt for summarization
-            prompt = f"Summarize the following medical article:\n\n{sample['article']}\n\nSummary:"
+            prompt = f"Summarize the following article:\n\n{sample['text']}\n\nSummary:"
             
             inputs = tokenizer(prompt, return_tensors="pt").to(config.device)
             
@@ -121,7 +122,7 @@ def run_single_strategy_benchmark(config, strategy):
             # Store generated summary and reference
             new_tokens = output[:, inputs.input_ids.shape[1]:]
             outputs_list.append(tokenizer.decode(new_tokens[0], skip_special_tokens=True))
-            references_list.append(sample['abstract'])
+            references_list.append(sample['summary'])
             
             metrics['inference_times'].append(inference_time)
             metrics['total_tokens'] += len(new_tokens[0])
