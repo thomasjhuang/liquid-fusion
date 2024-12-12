@@ -55,11 +55,9 @@ python -m scripts.run_benchmark \
 ### Available Options
 
 - `--model`: Model identifier (default: "huggyllama/llama-7b")
-- `--strategy`: Attention strategy ["full", "streaming", "h2o", "liquid_fusion", "local"]
-- `--cache-size`: Cache size percentage [4, 20, 40, 80, 100]
-- `--device`: Computing device ["cuda", "cpu"]
+- `--strategy`: Attention strategy ["full", "streaming", "h2o", "liquid_fusion"]
+- `--device`: Computing device ["cuda", "cpu", "mps"]
 - `--max-tokens`: Maximum tokens to generate (default: 32)
-- `--temperature`: Sampling temperature (default: 0.7)
 
 ### Attention Parameters
 
