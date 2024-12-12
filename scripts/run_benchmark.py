@@ -12,6 +12,10 @@ from data.config import BenchmarkConfig
 import time, copy
 from datasets import load_dataset
 from rouge_score import rouge_scorer
+import os
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +85,6 @@ def run_single_strategy_benchmark(config, strategy):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # Load Pubmed dataset instead of COPA
     dataset = load_dataset(
         config.datasets[0].name,
         "english",
@@ -118,6 +121,10 @@ def run_single_strategy_benchmark(config, strategy):
                     pad_token_id=tokenizer.pad_token_id
                 )
             inference_time = time.time() - start_time
+
+            # Optionally capture attention weights for visualization
+            if output.attentions is not None:
+                visualize_attention(output.attentions[-1], strategy)
             
             # Store generated summary and reference
             new_tokens = output[:, inputs.input_ids.shape[1]:]
@@ -224,10 +231,19 @@ def run_benchmark(args):
             all_results[strategy_name] = {"error": str(e)}
             logger.exception("Full traceback:")
     
+    # Create results directory if it doesn't exist
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    
     # Save combined results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    with open(f"copa_benchmark_summary_{timestamp}.json", 'w') as f:
+    results_path = results_dir / f"xlsum_benchmark_summary_{timestamp}.json"  # Changed from copa to xlsum
+    
+    # Save results
+    with open(results_path, 'w') as f:
         json.dump(all_results, f, indent=2)
+    
+    logger.info(f"Results saved to: {results_path}")
     
     # Device-specific cleanup
     if torch.cuda.is_available() and args.device == "cuda":
@@ -237,6 +253,28 @@ def run_benchmark(args):
     gc.collect()
     
     return all_results
+
+def visualize_attention(attention_weights, strategy_name, save_dir="attention_plots"):
+    """
+    Visualize attention weights for different attention mechanisms
+    
+    Args:
+        attention_weights: torch.Tensor of shape (batch_size, num_heads, seq_len, seq_len)
+        strategy_name: Name of attention strategy
+        save_dir: Directory to save plots
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Average across heads and batch
+    avg_attention = attention_weights.mean(dim=(0,1)).cpu().numpy()
+    
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(avg_attention, cmap='viridis')
+    plt.title(f'Attention Pattern - {strategy_name}')
+    plt.xlabel('Key Sequence')
+    plt.ylabel('Query Sequence')
+    plt.savefig(f'{save_dir}/attention_{strategy_name}.png')
+    plt.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
