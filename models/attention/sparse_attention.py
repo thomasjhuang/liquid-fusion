@@ -72,7 +72,6 @@ class LlamaAttention_Sparse_Strided(LlamaAttention):
 def convert_attention_type(model, attention_type: str, config: LlamaConfig):
     """Convert model's attention layers to specified type"""
     attention_classes = {
-        "h2o": LlamaAttention_heavy_hitter,
         "sparse_fixed": LlamaAttention_Sparse_Fixed,
         "sparse_strided": LlamaAttention_Sparse_Strided
     }

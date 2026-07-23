@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 *.class
 .env
 .venv
@@ -16,7 +17,7 @@ benchmark*results*.json
 benchmarking*results*.json
 *_results.json
 *_results.jsonl
-cache/
+/cache/
 .cache/
 scripts/benchmark_results
 benchmark_results/
