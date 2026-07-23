@@ -1,315 +1,312 @@
 import argparse
-import json
-import torch
-from tqdm import tqdm
-import logging
-from datetime import datetime
+import copy
 import gc
-from transformers import AutoTokenizer, GenerationConfig
-from models.base_models import ModelLoader
-from models.attention.sparse_attention import convert_attention_type
-from data.config import BenchmarkConfig
-import time, copy
+import json
+import logging
+import platform
+import time
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict
+
+import torch
+import transformers
 from datasets import load_dataset
 from rouge_score import rouge_scorer
-import os
-from pathlib import Path
-import matplotlib.pyplot as plt
-import seaborn as sns
+from tqdm import tqdm
+
+from data.config import BenchmarkConfig, DatasetConfig
+from models.base_models import ModelLoader
+
 
 logger = logging.getLogger(__name__)
 
-def get_generation_config(tokenizer, input_ids, config):
-    """Standardized generation configuration with proper attention mask"""
-    # Create attention mask (1 for real tokens, 0 for padding)
-    attention_mask = torch.ones_like(input_ids)
-    
-    # Create GenerationConfig object instead of dictionary
-    return GenerationConfig(
-        max_new_tokens=config.max_tokens,
-        do_sample=False,  # For deterministic outputs in benchmarking
-        num_return_sequences=1,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        use_cache=True,
-        output_attentions=False,
-        output_hidden_states=False,
-        return_dict_in_generate=True,
-        output_scores=True
-    ), attention_mask  # Return both config and attention mask
 
-def calculate_accuracy(outputs, labels, tokenizer, task_type="multiple_choice"):
-    """Calculate accuracy based on task type"""
-    correct = 0
-    total = len(outputs)
-    
-    if task_type == "copa":
-        for output, label in zip(outputs, labels):
-            # Get only the newly generated tokens
-            response = tokenizer.decode(output[0], skip_special_tokens=True)
-            
-            # Extract predicted choice (1 or 2)
-            predicted_choice = None
-            if '1' in response:
-                predicted_choice = 0  # 0-based index
-            elif '2' in response:
-                predicted_choice = 1
-                
-            # Check if prediction matches label
-            if predicted_choice is not None and predicted_choice == label:
-                correct += 1
+def _synchronize(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif device == "mps" and torch.backends.mps.is_available():
+        torch.mps.synchronize()
 
-    return correct / total if total > 0 else 0.0
 
-def run_single_strategy_benchmark(config, strategy):
-    """Run benchmark for a single attention strategy"""
-    # Set seeds for reproducibility
-    seed = 42
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    import random
-    import numpy as np
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    logger.info(f"\n=== Starting benchmark for strategy: {strategy} ===")
-    
-    # Load model and tokenizer
-    model_loader = ModelLoader(config)
-    model, tokenizer = model_loader.load_model_and_tokenizer()
-
-    # Configure tokenizer
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    dataset = load_dataset(
-        config.datasets[0].name,
-        "english",
-        split=config.datasets[0].splits[0],
-        streaming=True  # Enable streaming
-    )
-    # Take only max_samples
-    dataset = dataset.take(config.max_samples)
-    
-    metrics = {
-        'rouge_scores': [],
-        'inference_times': [],
-        'total_tokens': 0,
-        'total_time': 0
-    }
-
-    outputs_list = []
-    references_list = []
-    
-    try:
-        for sample in tqdm(dataset, desc=f"Evaluating {strategy}"):
-            # Format prompt for summarization
-            prompt = f"Summarize the following article:\n\n{sample['text']}\n\nSummary:"
-            
-            inputs = tokenizer(prompt, return_tensors="pt").to(config.device)
-            
-            # Generate summary
-            start_time = time.time()
-            with torch.no_grad():
-                output = model.generate(
-                    **inputs,
-                    max_new_tokens=128,  # Adjust based on desired summary length
-                    num_return_sequences=1,
-                    pad_token_id=tokenizer.pad_token_id
-                )
-            inference_time = time.time() - start_time
-
-            # Optionally capture attention weights for visualization
-            if output.attentions is not None:
-                visualize_attention(output.attentions[-1], strategy)
-            
-            # Store generated summary and reference
-            new_tokens = output[:, inputs.input_ids.shape[1]:]
-            outputs_list.append(tokenizer.decode(new_tokens[0], skip_special_tokens=True))
-            references_list.append(sample['summary'])
-            
-            metrics['inference_times'].append(inference_time)
-            metrics['total_tokens'] += len(new_tokens[0])
-            metrics['total_time'] += inference_time
-
-    except Exception as e:
-        logger.error(f"Error in {strategy}: {str(e)}")
-        raise e
-
-    # Calculate ROUGE scores
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-    
-    for output, reference in zip(outputs_list, references_list):
-        scores = scorer.score(output, reference)
-        metrics['rouge_scores'].append(scores)
-
-    # Calculate average metrics
-    avg_metrics = {
-        'avg_rouge1': sum(s['rouge1'].fmeasure for s in metrics['rouge_scores']) / len(metrics['rouge_scores']),
-        'avg_rouge2': sum(s['rouge2'].fmeasure for s in metrics['rouge_scores']) / len(metrics['rouge_scores']),
-        'avg_rougeL': sum(s['rougeL'].fmeasure for s in metrics['rouge_scores']) / len(metrics['rouge_scores']),
-        'avg_tokens_per_second': metrics['total_tokens'] / metrics['total_time'],
-        'avg_inference_time': sum(metrics['inference_times']) / len(metrics['inference_times'])
-    }
-
-    return avg_metrics
-
-def run_benchmark(args):
-    """Run benchmark across all specified strategies"""
-    if not hasattr(args, 'strategies'):
-        logger.warning("No strategies specified in config, using only the configured attention_type")
-        strategies_to_run = [args.attention_type]
-    else:
-        strategies_to_run = args.strategies
-    
-    logger.info(f"Running benchmark with strategies: {strategies_to_run}")
-    
-    strategies = {
-        "full": lambda c: setattr(c, "attention_type", "default"),
-        "streaming": lambda c: {
-            setattr(c, "attention_type", "streaming"),
-            setattr(c, "start_size", c.start_size),
-            setattr(c, "recent_size", c.recent_size)
-        },
-        "h2o": lambda c: setattr(c, "attention_type", "h2o"),
-        "sparse_fixed": lambda c: {
-            setattr(c, "attention_type", "sparse_fixed"),
-            setattr(c, "window_size", args.window_size if hasattr(args, 'window_size') else 256)
-        },
-        "sparse_strided": lambda c: {
-            setattr(c, "attention_type", "sparse_strided"),
-            setattr(c, "window_size", args.window_size if hasattr(args, 'window_size') else 256),
-            setattr(c, "stride", args.stride if hasattr(args, 'stride') else 128)
-        },
-        "liquid_fusion": lambda c: {
-            setattr(c, "attention_type", "liquid_fusion"),
-        }
-    }
-    
-    all_results = {}
-    
-    for strategy_name in strategies_to_run:
-        logger.info(f"\nTesting {strategy_name} strategy...")
-        config = copy.deepcopy(args)
-        
-        # Apply strategy configuration
-        strategy_fn = strategies[strategy_name]
-        if isinstance(strategy_fn(config), dict):
-            logger.info(f"Applied {strategy_name} configuration with start_size={config.start_size}, recent_size={config.recent_size}")
-        else:
-            logger.info(f"Applied {strategy_name} configuration")
-        
-        logger.info(f"Config attention_type set to: {config.attention_type}")
-        
-        # Clear any existing cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch.mps, 'empty_cache'):
-            torch.mps.empty_cache()
-        gc.collect()
-        
-        try:
-            result = run_single_strategy_benchmark(
-                config,
-                strategy=strategy_name
-            )
-            all_results[strategy_name] = result
-            
-            # Force cleanup after each strategy
-            del result
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif hasattr(torch.mps, 'empty_cache'):
-                torch.mps.empty_cache()
-                
-        except Exception as e:
-            logger.error(f"Error in {strategy_name}: {str(e)}")
-            all_results[strategy_name] = {"error": str(e)}
-            logger.exception("Full traceback:")
-    
-    # Create results directory if it doesn't exist
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-    
-    # Save combined results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_path = results_dir / f"xlsum_benchmark_summary_{timestamp}.json"  # Changed from copa to xlsum
-    
-    # Save results
-    with open(results_path, 'w') as f:
-        json.dump(all_results, f, indent=2)
-    
-    logger.info(f"Results saved to: {results_path}")
-    
-    # Device-specific cleanup
-    if torch.cuda.is_available() and args.device == "cuda":
+def _clear_device(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
-    elif hasattr(torch.mps, 'empty_cache'):
+    elif device == "mps" and torch.backends.mps.is_available():
         torch.mps.empty_cache()
     gc.collect()
-    
-    return all_results
 
-def visualize_attention(attention_weights, strategy_name, save_dir="attention_plots"):
-    """
-    Visualize attention weights for different attention mechanisms
-    
-    Args:
-        attention_weights: torch.Tensor of shape (batch_size, num_heads, seq_len, seq_len)
-        strategy_name: Name of attention strategy
-        save_dir: Directory to save plots
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Average across heads and batch
-    avg_attention = attention_weights.mean(dim=(0,1)).cpu().numpy()
-    
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(avg_attention, cmap='viridis')
-    plt.title(f'Attention Pattern - {strategy_name}')
-    plt.xlabel('Key Sequence')
-    plt.ylabel('Query Sequence')
-    plt.savefig(f'{save_dir}/attention_{strategy_name}.png')
-    plt.close()
 
-if __name__ == '__main__':
+def _cache_capacity(config: BenchmarkConfig, strategy: str):
+    if strategy == "streaming":
+        return config.start_size + config.recent_size
+    if strategy == "h2o":
+        return config.heavy_budget + config.recent_budget
+    if strategy == "liquid_fusion":
+        return config.sink_size + config.heavy_budget + config.recent_budget
+    return None
+
+
+def _load_benchmark_dataset(dataset_config: DatasetConfig, max_samples: int):
+    kwargs = {
+        "path": dataset_config.name,
+        "split": dataset_config.splits[0],
+        "streaming": True,
+    }
+    if dataset_config.config:
+        kwargs["name"] = dataset_config.config
+    if dataset_config.revision:
+        kwargs["revision"] = dataset_config.revision
+    return load_dataset(**kwargs).take(
+        dataset_config.max_samples or max_samples
+    )
+
+
+def _tokenize_prompt(
+    tokenizer,
+    dataset_config: DatasetConfig,
+    sample,
+    max_input_tokens: int,
+    device: str,
+):
+    prefix = tokenizer.encode(
+        dataset_config.input_prefix,
+        add_special_tokens=True,
+    )
+    suffix = tokenizer.encode(
+        dataset_config.output_prefix,
+        add_special_tokens=False,
+    )
+    document = tokenizer.encode(
+        str(sample[dataset_config.input_field]),
+        add_special_tokens=False,
+    )
+    available_document_tokens = max_input_tokens - len(prefix) - len(suffix)
+    if available_document_tokens < 1:
+        raise ValueError("sequence_length is too small for the benchmark prompt")
+    input_ids = torch.tensor(
+        [prefix + document[:available_document_tokens] + suffix],
+        dtype=torch.long,
+        device=device,
+    )
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+    }
+
+
+def run_single_strategy_benchmark(
+    config: BenchmarkConfig,
+    strategy: str,
+) -> Dict[str, float]:
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    model, tokenizer = ModelLoader(config).load_model_and_tokenizer()
+    tokenizer.padding_side = "left"
+    dataset_config = config.datasets[0]
+    dataset = _load_benchmark_dataset(dataset_config, config.max_samples)
+    scorer = rouge_scorer.RougeScorer(
+        ["rouge1", "rouge2", "rougeL"],
+        use_stemmer=True,
+    )
+
+    rouge_scores = []
+    inference_times = []
+    generated_tokens = 0
+    input_lengths = []
+    model_context = getattr(
+        model.config,
+        "max_position_embeddings",
+        config.sequence_length + config.max_new_tokens,
+    )
+    max_input_tokens = min(
+        config.sequence_length,
+        model_context - config.max_new_tokens,
+    )
+    if max_input_tokens < 1:
+        raise ValueError("max_new_tokens leaves no room for an input prompt")
+
+    if config.device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    for sample in tqdm(dataset, desc=f"Evaluating {strategy}"):
+        inputs = _tokenize_prompt(
+            tokenizer,
+            dataset_config,
+            sample,
+            max_input_tokens,
+            config.device,
+        )
+        input_length = inputs["input_ids"].shape[1]
+
+        _synchronize(config.device)
+        started_at = time.perf_counter()
+        with torch.inference_mode():
+            output = model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=config.max_new_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+        _synchronize(config.device)
+        elapsed = time.perf_counter() - started_at
+
+        new_tokens = output[:, input_length:]
+        prediction = tokenizer.decode(
+            new_tokens[0],
+            skip_special_tokens=True,
+        )
+        reference = sample[dataset_config.reference_field]
+        rouge_scores.append(scorer.score(reference, prediction))
+        inference_times.append(elapsed)
+        generated_tokens += new_tokens.shape[1]
+        input_lengths.append(input_length)
+
+    total_time = sum(inference_times)
+    count = len(rouge_scores)
+    peak_memory = (
+        torch.cuda.max_memory_allocated()
+        if config.device.startswith("cuda") and torch.cuda.is_available()
+        else 0
+    )
+    result = {
+        "samples": count,
+        "avg_rouge1": sum(score["rouge1"].fmeasure for score in rouge_scores) / count,
+        "avg_rouge2": sum(score["rouge2"].fmeasure for score in rouge_scores) / count,
+        "avg_rougeL": sum(score["rougeL"].fmeasure for score in rouge_scores) / count,
+        "avg_generation_time_seconds": total_time / count,
+        "output_tokens_per_second": generated_tokens / total_time,
+        "avg_input_tokens": sum(input_lengths) / count,
+        "min_input_tokens": min(input_lengths),
+        "max_input_tokens": max(input_lengths),
+        "generated_tokens": generated_tokens,
+        "peak_device_memory_bytes": peak_memory,
+        "configured_cache_tokens": _cache_capacity(config, strategy),
+        "attention_backend": "sdpa" if strategy == "full" else "eager_reference",
+        "model_name": config.model_name,
+        "model_revision": config.model_revision,
+        "dataset_name": dataset_config.name,
+        "dataset_revision": dataset_config.revision,
+        "dataset_split": dataset_config.splits[0],
+        "strategy": strategy,
+        "device": config.device,
+        "dtype": config.dtype,
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "platform": platform.platform(),
+        "configuration": asdict(config),
+    }
+
+    del model
+    _clear_device(config.device)
+    return result
+
+
+def run_benchmark(config: BenchmarkConfig) -> Dict[str, Dict[str, float]]:
+    strategy_names = config.strategies or [config.attention_type]
+    supported = {"full", "streaming", "h2o", "liquid_fusion"}
+    unknown = set(strategy_names) - supported
+    if unknown:
+        raise ValueError(f"Unsupported strategies: {sorted(unknown)}")
+
+    results = {}
+    for strategy in strategy_names:
+        strategy_config = copy.deepcopy(config)
+        strategy_config.attention_type = "default" if strategy == "full" else strategy
+        logger.info("Running strategy %s", strategy)
+        try:
+            results[strategy] = run_single_strategy_benchmark(
+                strategy_config,
+                strategy,
+            )
+        except Exception as error:
+            logger.exception("Strategy %s failed", strategy)
+            results[strategy] = {"error": str(error)}
+        _clear_device(config.device)
+
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_path = results_dir / f"benchmark_{timestamp}.json"
+    result_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    logger.info("Saved results to %s", result_path)
+    return results
+
+
+def _default_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def parse_args() -> BenchmarkConfig:
     parser = argparse.ArgumentParser()
-    # Get default device
-    if torch.cuda.is_available():
-        default_device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        default_device = "mps"
-    else:
-        default_device = "cpu"
-
-    parser.add_argument("--model_name", type=str, required=True)
-    parser.add_argument("--strategies", nargs="+", 
-                       default=["full", "streaming", "h2o", "sparse_fixed", "sparse_strided", "liquid_fusion"])
-    parser.add_argument("--sequence_length", type=int, default=512)
-    parser.add_argument("--dtype", type=str, default="float16")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--start_size", type=int, default=4)
-    parser.add_argument("--recent_size", type=int, default=64)
-    parser.add_argument("--window_size", type=int, default=256)
-    parser.add_argument("--stride", type=int, default=128)
+    parser.add_argument("--model", "--model_name", dest="model_name", required=True)
+    parser.add_argument("--model_revision")
+    parser.add_argument(
+        "--strategies",
+        "--strategy",
+        nargs="+",
+        default=["full", "liquid_fusion"],
+        choices=["full", "streaming", "h2o", "liquid_fusion"],
+    )
+    parser.add_argument("--device", default=_default_device())
+    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--sequence_length", type=int, default=2048)
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--max_samples", type=int, default=10)
     parser.add_argument("--sink_size", type=int, default=4)
-    parser.add_argument("--heavy_ratio", type=float, default=0.1)
-    parser.add_argument("--recent_ratio", type=float, default=0.1)
-    # Updated device argument to include MPS
-    parser.add_argument("--device", type=str, 
-                       default=default_device,
-                       help="Device to run on (cuda/mps/cpu)")
-    
+    parser.add_argument("--start_size", type=int, default=4)
+    parser.add_argument("--recent_size", type=int, default=512)
+    parser.add_argument("--heavy_budget", type=int, default=256)
+    parser.add_argument("--recent_budget", type=int, default=256)
+    parser.add_argument("--dataset_name", default="EdinburghNLP/xsum")
+    parser.add_argument("--dataset_config")
+    parser.add_argument("--dataset_revision")
+    parser.add_argument("--dataset_split", default="test")
+    parser.add_argument("--input_field", default="document")
+    parser.add_argument("--reference_field", default="summary")
+    parser.add_argument(
+        "--trust_remote_code",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     args = parser.parse_args()
-    
-    # Set random seed
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    
-    results = run_benchmark(args)
+    dataset = DatasetConfig(
+        name=args.dataset_name,
+        config=args.dataset_config,
+        revision=args.dataset_revision,
+        splits=[args.dataset_split],
+        input_field=args.input_field,
+        reference_field=args.reference_field,
+    )
+    return BenchmarkConfig(
+        model_name=args.model_name,
+        model_revision=args.model_revision,
+        device=args.device,
+        dtype=args.dtype,
+        strategies=args.strategies,
+        sequence_length=args.sequence_length,
+        max_new_tokens=args.max_new_tokens,
+        max_samples=args.max_samples,
+        sink_size=args.sink_size,
+        start_size=args.start_size,
+        recent_size=args.recent_size,
+        heavy_budget=args.heavy_budget,
+        recent_budget=args.recent_budget,
+        datasets=[dataset],
+        trust_remote_code=args.trust_remote_code,
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    benchmark_results = run_benchmark(parse_args())
+    if any("error" in result for result in benchmark_results.values()):
+        raise SystemExit(1)

@@ -143,7 +143,7 @@ class DatasetManager:
         for dataset_config in self.config.datasets:
             for split in dataset_config.splits:
                 key = f"{dataset_config.name}_{split}"
-                dataset = self.load_dataset(dataset_config.name, split)
+                dataset = self.load_dataset(dataset_config.name, split, batch_size=1)
                 if dataset is not None:
                     datasets[key] = dataset
         return datasets
